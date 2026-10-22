@@ -1,0 +1,4300 @@
+import csv
+import asyncio
+import html
+import io
+import math
+import os
+import random
+import re
+import statistics
+import tempfile
+import unicodedata
+import uuid
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+import requests
+import streamlit as st
+from plotly.subplots import make_subplots
+
+from api_config import (
+    obtener_api_key,
+    render_api_configuration_panel,
+    verificar_apis_requeridas,
+)
+from api_integrations import DataEnrichment
+from all_combinations_engine import PROFILE_LIMITS, generate_combinations, profile_key
+from card_pro import render_card_pro
+from league_filters import obtener_filtros_recomendados
+import date_range
+import small_bankroll
+from totals_market import summarize_totals
+from market_consistency import scan_inconsistencies
+from sharp_vs_square import calculate_sharp_vs_square_odds
+from auto_analyst import (
+    RANK as VERDICT_RANK,
+    analyze_combination,
+    analyze_match,
+    analyze_totals,
+)
+from data_sanitizer import (
+    MAX_BOOKMAKER_OVERROUND_PERCENT,
+    MAX_DISPLAYABLE_EV,
+    MAX_ODDS,
+    MIN_BOOKMAKER_OVERROUND_PERCENT,
+    MIN_ODDS,
+    MIN_QUOTES_PER_OUTCOME,
+    calcular_mediana_segura,
+    calculate_clv,
+    calcular_ev_seguro,
+    calcular_overround_seguro,
+    calcular_probabilidades_1x2,
+    cuota_valida,
+    limpiar_cuotas_por_casa,
+)
+from smart_ui import render_match_fusion
+from steam_moves import DEFAULT_THRESHOLD as STEAM_THRESHOLD, detect_steam_moves
+from weather_integration import fetch_match_weather
+from qwen_analyst import (
+    DEFAULT_MODEL as DEFAULT_QWEN_MODEL,
+    get_qwen_analyst,
+    get_qwen_api_key,
+    get_qwen_model,
+)
+
+BASE_URL = "https://api.the-odds-api.com/v4"
+REGION = "eu"
+MARKET = "h2h"
+MIN_VALID_ODDS = MIN_ODDS
+MAX_VALID_ODDS = MAX_ODDS
+MAX_EVENT_OVERROUND_PERCENT = MAX_BOOKMAKER_OVERROUND_PERCENT
+REFRESH_INTERVAL_SECONDS = 15 * 60
+HISTORY_PATH = Path(__file__).with_name("historico_ev.csv")
+BET_TRACKER_PATH = Path(__file__).with_name("mis_apuestas.csv")
+
+
+def redact_secrets(error):
+    """Texto del error sin claves de API en la URL (apiKey=..., key=..., appid=...)."""
+    return re.sub(
+        r"(?i)\b(apikey|api_key|key|appid|x-apisports-key)=[^&\s'\"]+",
+        r"\1=***",
+        str(error),
+    )
+RISK_PROFILES = {
+    "🛡️ Conservador": {
+        "ev_threshold": 7.0,
+        "minimum_probability": 50.0,
+        "minimum_kelly_stake": 2.0,
+        "minimum_confidence": "Alta",
+    },
+    "⚖️ Moderado": {
+        "ev_threshold": 5.0,
+        "minimum_probability": 40.0,
+        "minimum_kelly_stake": 1.0,
+        "minimum_confidence": "Media",
+    },
+    "⚡ Agresivo": {
+        "ev_threshold": 3.0,
+        "minimum_probability": 30.0,
+        "minimum_kelly_stake": 0.5,
+        "minimum_confidence": "Baja",
+    },
+}
+CONFIDENCE_RANK = {"Baja": 0, "Media": 1, "Alta": 2}
+PERSONAL_BET_FIELDS = (
+    "ID",
+    "Fecha UTC",
+    "Competencia",
+    "Partido",
+    "Selección",
+    "Cuota",
+    "Stake ($)",
+    "EV estimado (%)",
+    "Prob. estimada (%)",
+    "Resultado",
+    "Ganancia neta ($)",
+    "Cuota cierre",
+    "CLV (%)",
+)
+OPTIONAL_BET_FIELDS = frozenset({"Cuota cierre", "CLV (%)"})
+COMPETICIONES_POR_TIER = {
+    "🔥 TOP VALOR": {
+        "Championship (Inglaterra)": "soccer_efl_champ",
+        "Segunda División (España)": "soccer_spain_segunda_division",
+        "Liga MX": "soccer_mexico_ligamx",
+        "Eredivisie": "soccer_netherlands_eredivisie",
+        "Copa Libertadores": "soccer_conmebol_copa_libertadores",
+        "Copa Sudamericana": "soccer_conmebol_copa_sudamericana",
+    },
+    "📈 ALTO VALOR": {
+        "Brasileirão Série A": "soccer_brazil_campeonato",
+        "Liga Profesional (Argentina)": "soccer_argentina_primera_division",
+        "MLS": "soccer_usa_mls",
+        "Primeira Liga (Portugal)": "soccer_portugal_primeira_liga",
+        "UEFA Europa League": "soccer_uefa_europa_league",
+    },
+    "🎯 VALOR MODERADO": {
+        "Belgian Pro League": "soccer_belgium_first_div",
+        "Scottish Premiership": "soccer_spl",
+        "Serie B (Italia)": "soccer_italy_serie_b",
+        "2. Bundesliga": "soccer_germany_bundesliga2",
+    },
+    "⚠️ BAJO VALOR": {
+        "UEFA Champions League": "soccer_uefa_champs_league",
+    },
+}
+COMPETICIONES_DISPONIBLES = {
+    f"{tier} · {name}": sport_key
+    for tier, competitions in COMPETICIONES_POR_TIER.items()
+    for name, sport_key in competitions.items()
+}
+
+st.set_page_config(page_title="Market Efficiency Scanner", layout="wide")
+st.title("Market Efficiency Scanner")
+st.caption("Comparador descriptivo de cuotas 1X2. Las alertas indican diferencias de precios, no predicciones ni recomendaciones de apuesta.")
+st.markdown(
+    """
+    <style>
+    :root {
+        color-scheme: dark;
+    }
+    body, .stApp {
+        background-color: #0b1020;
+        color: #e5e7eb;
+    }
+    div[data-testid="stAppViewContainer"] {
+        background:
+            radial-gradient(ellipse at top left, rgba(79, 70, 229, 0.18), transparent 42%),
+            linear-gradient(145deg, #0b1020, #111827 58%, #10172a);
+    }
+    section[data-testid="stSidebar"] > div {
+        background: linear-gradient(180deg, #111827, #0b1020);
+        border-right: 1px solid rgba(148, 163, 184, 0.16);
+    }
+    .metric-card {
+        padding: 1rem;
+        border-radius: 0.75rem;
+        border: 1px solid rgba(128, 128, 128, 0.28);
+        background: linear-gradient(
+            135deg,
+            rgba(49, 64, 112, 0.72),
+            rgba(64, 43, 93, 0.58)
+        );
+        box-shadow: 0 4px 14px rgba(0, 0, 0, 0.24);
+        transition: transform 160ms ease, box-shadow 160ms ease;
+    }
+    .terminal-kpi {
+        min-height: 112px;
+        padding: 1rem 1.1rem;
+        border: 1px solid rgba(148, 163, 184, 0.2);
+        border-radius: 0.85rem;
+        background: linear-gradient(145deg, rgba(20, 31, 55, 0.92), rgba(30, 24, 48, 0.82));
+        box-shadow: inset 0 1px rgba(255, 255, 255, 0.035), 0 8px 20px rgba(0, 0, 0, 0.16);
+    }
+    .terminal-kpi-label {
+        color: #aab7cf;
+        font-size: 0.78rem;
+        font-weight: 700;
+        letter-spacing: 0.06em;
+        text-transform: uppercase;
+    }
+    .terminal-kpi-value {
+        margin-top: 0.45rem;
+        color: #f8fafc;
+        font-size: 1.7rem;
+        font-weight: 800;
+        line-height: 1.1;
+        font-variant-numeric: tabular-nums;
+    }
+    .terminal-kpi-foot {
+        margin-top: 0.4rem;
+        color: #94a3b8;
+        font-size: 0.78rem;
+    }
+    .one-click-card {
+        margin: 0.8rem 0;
+        padding: 0.9rem 1rem;
+        border: 1px solid rgba(148, 163, 184, 0.22);
+        border-radius: 0.85rem;
+        background: linear-gradient(120deg, rgba(14, 116, 144, 0.14), rgba(30, 41, 59, 0.36));
+    }
+    .metric-card:hover {
+        transform: translateY(-3px);
+        box-shadow: 0 9px 24px rgba(102, 126, 234, 0.2);
+    }
+    .metric-card [data-testid="stMetricValue"] {
+        font-weight: bold;
+    }
+    .match-card-title {
+        font-size: 1.05rem;
+        font-weight: 700;
+    }
+    div[data-testid="stExpander"] {
+        border: 1px solid rgba(128, 128, 128, 0.28);
+        border-radius: 0.75rem;
+        background: linear-gradient(
+            135deg,
+            rgba(30, 41, 72, 0.68),
+            rgba(35, 28, 51, 0.56)
+        );
+        transition: transform 160ms ease, box-shadow 160ms ease;
+    }
+    div[data-testid="stExpander"]:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 8px 22px rgba(102, 126, 234, 0.15);
+    }
+    .confidence-badge, .ev-badge {
+        display: inline-block;
+        padding: 0.18rem 0.55rem;
+        border-radius: 999px;
+        font-weight: 700;
+        font-size: 0.82rem;
+        margin: 0.1rem 0;
+    }
+    .confidence-high, .ev-positive {
+        color: #087443;
+        background: rgba(16, 185, 129, 0.16);
+    }
+    .confidence-medium, .ev-moderate {
+        color: #8a5a00;
+        background: rgba(245, 158, 11, 0.18);
+    }
+    .confidence-low, .ev-negative {
+        color: #b42318;
+        background: rgba(239, 68, 68, 0.15);
+    }
+    .confidence-high, .ev-positive { color: #6ee7b7; }
+    .confidence-medium, .ev-moderate { color: #fcd34d; }
+    .confidence-low, .ev-negative { color: #fca5a5; }
+    .action-card {
+        border: 1px solid rgba(148, 163, 184, 0.25);
+        border-radius: 0.9rem;
+        padding: 0.9rem 1rem;
+        background: linear-gradient(135deg, rgba(15, 118, 110, 0.14), rgba(30, 41, 59, 0.34));
+        margin: 0.8rem 0 1rem 0;
+    }
+    .action-badge {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        padding: 0.45rem 0.8rem;
+        border-radius: 999px;
+        font-size: 0.8rem;
+        font-weight: 800;
+        letter-spacing: 0.04em;
+        margin-bottom: 0.5rem;
+    }
+    .action-safe { background: rgba(16, 185, 129, 0.18); color: #6ee7b7; }
+    .action-warning { background: rgba(245, 158, 11, 0.16); color: #fcd34d; }
+    .action-danger { background: rgba(239, 68, 68, 0.14); color: #fca5a5; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+
+@st.cache_resource
+def get_data_enrichment(api_key):
+    return DataEnrichment(api_key)
+
+
+def get_api_key():
+    try:
+        return obtener_api_key("ODDS_API_KEY", st.secrets)
+    except (OSError, ValueError, KeyError):
+        return None
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def api_get(path, params):
+    headers = {"x-apisports-key": api_key}
+    response = requests.get(f"{BASE_URL}{path}", headers=headers, timeout=30)
+    response.raise_for_status()
+    return response.json(), response.headers
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_soccer_competitions(api_key):
+    response = requests.get(
+        f"{BASE_URL}/sports/",
+        params={"apiKey": api_key, "all": "true"},
+        timeout=10,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, list):
+        raise ValueError("The Odds API devolvió un catálogo de deportes inválido.")
+    competitions = {}
+    for sport in payload:
+        if not isinstance(sport, dict):
+            continue
+        key = sport.get("key")
+        title = sport.get("title")
+        group = sport.get("group", "Fútbol")
+        if (
+            isinstance(key, str)
+            and key.startswith("soccer_")
+            and isinstance(title, str)
+            and title.strip()
+        ):
+            label = f"{group}: {title}" if group else title
+            competitions[label] = key
+    if not competitions:
+        raise ValueError("The Odds API no devolvió competencias de fútbol activas.")
+    return dict(sorted(competitions.items(), key=lambda item: item[0].casefold()))
+
+
+def normalize_outcome_name(name):
+    normalized = unicodedata.normalize("NFKD", str(name or ""))
+    without_accents = "".join(
+        char for char in normalized if not unicodedata.combining(char)
+    )
+    return " ".join(without_accents.casefold().split())
+
+
+def calculate_overround(home_odds, draw_odds, away_odds):
+    overround = calcular_overround_seguro(
+        home_odds,
+        draw_odds,
+        away_odds,
+        min_overround=None,
+        max_overround=None,
+    )
+    if overround is None:
+        raise ValueError("Se requieren cuotas 1X2 válidas para calcular overround.")
+    return overround
+
+
+def calculate_expected_value(probability, decimal_odds):
+    return probability * decimal_odds - 1
+
+
+def calculate_market_confidence(odds, median_odds):
+    if median_odds is None or len(odds) < MIN_QUOTES_PER_OUTCOME:
+        return "Baja"
+    consensus_count = sum(
+        1
+        for price in odds
+        if median_odds * 0.95 <= price <= median_odds * 1.05
+    )
+    confidence = consensus_count / len(odds)
+
+    if confidence >= 0.8:
+        return "Alta"
+    if confidence >= 0.6:
+        return "Media"
+    return "Baja"
+
+
+def calculate_consensus_percentage(odds, median_odds):
+    consensus_count = sum(
+        1
+        for price in odds
+        if median_odds * 0.95 <= price <= median_odds * 1.05
+    )
+    return round(consensus_count / len(odds) * 100, 1)
+
+
+def calculate_kelly_stake(
+    probability, decimal_odds, bankroll, fraction=0.25
+):
+    if not 0 <= probability <= 1:
+        raise ValueError("La probabilidad debe estar entre 0 y 1.")
+    if decimal_odds <= 1:
+        raise ValueError("La cuota decimal debe ser mayor que 1.")
+    if bankroll < 0:
+        raise ValueError("El bankroll no puede ser negativo.")
+    if not 0 <= fraction <= 1:
+        raise ValueError("La fracción Kelly debe estar entre 0 y 1.")
+
+    edge = calculate_expected_value(probability, decimal_odds)
+    if edge <= 0 or bankroll == 0 or fraction == 0:
+        return 0.0
+    full_kelly = edge / (decimal_odds - 1)
+    return min(bankroll, bankroll * full_kelly * fraction)
+
+
+def is_valid_odds(price):
+    return cuota_valida(price)
+
+
+def get_h2h_prices(event, market):
+    home = event.get("home_team")
+    away = event.get("away_team")
+    if not isinstance(home, str) or not isinstance(away, str):
+        return None
+
+    normalized_home = normalize_outcome_name(home)
+    normalized_away = normalize_outcome_name(away)
+    if not normalized_home or not normalized_away or normalized_home == normalized_away:
+        return None
+
+    prices = {}
+    draw_names = {"draw", "empate", "x", "tie"}
+    outcomes = market.get("outcomes", [])
+    if not isinstance(outcomes, list):
+        return None
+
+    for outcome in outcomes:
+        if not isinstance(outcome, dict):
+            continue
+        name = normalize_outcome_name(outcome.get("name"))
+        price = outcome.get("price")
+
+        if name == normalized_home:
+            selection = "home"
+        elif name == normalized_away:
+            selection = "away"
+        elif name in draw_names:
+            selection = "draw"
+        else:
+            continue
+
+        if selection in prices:
+            return None
+        try:
+            prices[selection] = float(price)
+        except (TypeError, ValueError, OverflowError):
+            prices[selection] = price
+
+    if set(prices) != {"home", "draw", "away"}:
+        return None
+    return prices
+
+
+def flatten_events(events, validation_warnings=None):
+    rows = []
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        home, away = event.get("home_team"), event.get("away_team")
+        bookmakers = event.get("bookmakers", [])
+        if not isinstance(bookmakers, list):
+            continue
+        for bookmaker in bookmakers:
+            if not isinstance(bookmaker, dict):
+                continue
+            markets = bookmaker.get("markets", [])
+            if not isinstance(markets, list):
+                continue
+            for market in markets:
+                if not isinstance(market, dict):
+                    continue
+                if market.get("key") != MARKET:
+                    continue
+                prices = get_h2h_prices(event, market)
+                if prices is None:
+                    continue
+                cleaned_prices, invalid_prices = limpiar_cuotas_por_casa(prices)
+                if invalid_prices:
+                    if validation_warnings is not None:
+                        bookmaker_name = bookmaker.get(
+                            "title", bookmaker.get("key", "Casa desconocida")
+                        )
+                        detail = ", ".join(invalid_prices[:3])
+                        validation_warnings.append(
+                            f"{home} vs {away} — {bookmaker_name}: "
+                            f"mercado excluido; {detail}. "
+                            f"Rango permitido: {MIN_VALID_ODDS:.2f}–"
+                            f"{MAX_VALID_ODDS:.0f}."
+                        )
+                    continue
+                h, d, a = (
+                    cleaned_prices["home"],
+                    cleaned_prices["draw"],
+                    cleaned_prices["away"],
+                )
+                margin = calcular_overround_seguro(h, d, a)
+                if margin is None:
+                    if validation_warnings is not None:
+                        bookmaker_name = bookmaker.get(
+                            "title", bookmaker.get("key", "Casa desconocida")
+                        )
+                        raw_margin = calculate_overround(h, d, a)
+                        validation_warnings.append(
+                            f"{home} vs {away} — {bookmaker_name}: "
+                            f"mercado excluido por overround "
+                            f"{raw_margin:.2f}% fuera del rango "
+                            f"{MIN_BOOKMAKER_OVERROUND_PERCENT:.0f}% a "
+                            f"{MAX_EVENT_OVERROUND_PERCENT:.0f}%."
+                        )
+                    continue
+                rows.append({
+                    "event_id": event.get("id"),
+                    "Inicio (UTC)": event.get("commence_time"),
+                    "Local": home,
+                    "Visitante": away,
+                    "Casa": bookmaker.get("title", bookmaker.get("key", "Unknown")),
+                    "Cuota local": h,
+                    "Cuota empate": d,
+                    "Cuota visitante": a,
+                    "Overround (%)": round(margin, 2),
+                    "Actualizado (UTC)": market.get("last_update"),
+                })
+    return rows
+
+
+def summarize_events(
+    rows,
+    edge_threshold,
+    bankroll=0.0,
+    kelly_fraction=0.25,
+    ev_threshold=5.0,
+    minimum_confidence="Media",
+):
+    groups = {}
+    for row in rows:
+        groups.setdefault(row["event_id"], []).append(row)
+    output = []
+    for event_id, group in groups.items():
+        if len(group) < MIN_QUOTES_PER_OUTCOME:
+            continue
+        outcomes = [
+            ("Local", "Cuota local", group[0]["Local"]),
+            ("Empate", "Cuota empate", "Empate"),
+            ("Visitante", "Cuota visitante", group[0]["Visitante"]),
+        ]
+        median_odds = {
+            name: calcular_mediana_segura(
+                [row[column] for row in group],
+                min_quotes=MIN_QUOTES_PER_OUTCOME,
+            )
+            for name, column, _ in outcomes
+        }
+        if any(price is None for price in median_odds.values()):
+            continue
+        median_overround = calcular_overround_seguro(
+            median_odds["Local"],
+            median_odds["Empate"],
+            median_odds["Visitante"],
+        )
+        if median_overround is None:
+            continue
+        fair_probabilities = {}
+        confidence_levels = {}
+        consensus_percentages = {}
+        market_probabilities = calcular_probabilidades_1x2(
+            {
+                "home": median_odds["Local"],
+                "draw": median_odds["Empate"],
+                "away": median_odds["Visitante"],
+            }
+        )
+        if market_probabilities is None:
+            continue
+        for name, column, _ in outcomes:
+            odds = [row[column] for row in group]
+            confidence = calculate_market_confidence(
+                odds, median_odds[name]
+            )
+            market_key = {"Local": "home", "Empate": "draw", "Visitante": "away"}[
+                name
+            ]
+            fair_probabilities[name] = market_probabilities[market_key]
+            confidence_levels[name] = confidence
+            consensus_percentages[name] = calculate_consensus_percentage(
+                odds, median_odds[name]
+            )
+        best_offers = {
+            name: max(group, key=lambda row: row[column])
+            for name, column, _ in outcomes
+        }
+        columns_by_outcome = {
+            name: column for name, column, _ in outcomes
+        }
+        visible_best_odds = {
+            name: round(best_offers[name][column], 2)
+            for name, column, _ in outcomes
+        }
+        outcome_ev = {}
+        for name, _, _ in outcomes:
+            safe_ev = (
+                calcular_ev_seguro(
+                    fair_probabilities[name],
+                    best_offers[name][columns_by_outcome[name]],
+                )
+                if fair_probabilities[name] is not None
+                else None
+            )
+            outcome_ev[name] = safe_ev * 100 if safe_ev is not None else None
+        suspicious_ev_outcomes = [
+            name
+            for name, _, _ in outcomes
+            if fair_probabilities[name] is not None
+            and outcome_ev[name] is None
+        ]
+        eligible_outcomes = [
+            name
+            for name, _, _ in outcomes
+            if outcome_ev[name] is not None
+            and CONFIDENCE_RANK[confidence_levels[name]]
+            >= CONFIDENCE_RANK[minimum_confidence]
+        ]
+        available_outcomes = [
+            name for name, _, _ in outcomes if outcome_ev[name] is not None
+        ]
+        best_outcome = max(
+            eligible_outcomes or available_outcomes,
+            key=lambda name: outcome_ev[name],
+            default=None,
+        )
+        best_ev = outcome_ev[best_outcome] if best_outcome is not None else None
+        best_offer = best_offers[best_outcome] if best_outcome is not None else None
+        best_price = (
+            best_offer[columns_by_outcome[best_outcome]]
+            if best_offer is not None
+            else None
+        )
+        outcome_lifts = {
+            name: (best_offers[name][column] / median_odds[name] - 1) * 100
+            for name, column, _ in outcomes
+        }
+        lift_outcome = max(outcome_lifts, key=outcome_lifts.get)
+        lift = outcome_lifts[lift_outcome]
+        avg_margin = statistics.mean(r["Overround (%)"] for r in group)
+        combined_best_overround = calculate_overround(
+            visible_best_odds["Local"],
+            visible_best_odds["Empate"],
+            visible_best_odds["Visitante"],
+        )
+        best_confidence = (
+            confidence_levels[best_outcome]
+            if best_outcome is not None
+            else "Baja"
+        )
+        kelly_stake = (
+            calculate_kelly_stake(
+                fair_probabilities[best_outcome],
+                best_price,
+                bankroll,
+                kelly_fraction,
+            )
+            if best_outcome is not None
+            and CONFIDENCE_RANK[best_confidence]
+            >= CONFIDENCE_RANK[minimum_confidence]
+            else 0.0
+        )
+        outcome_stakes = {
+            name: (
+                calculate_kelly_stake(
+                    fair_probabilities[name],
+                    best_offers[name][columns_by_outcome[name]],
+                    bankroll,
+                    kelly_fraction,
+                )
+                if fair_probabilities[name] is not None
+                and outcome_ev[name] is not None
+                and CONFIDENCE_RANK[confidence_levels[name]]
+                >= CONFIDENCE_RANK[minimum_confidence]
+                else 0.0
+            )
+            for name, _, _ in outcomes
+        }
+        alerts = []
+        if len(group) < 2:
+            alerts.append("Menos de 2 casas comparables")
+        if lift >= edge_threshold:
+            lift_price = best_offers[lift_outcome][columns_by_outcome[lift_outcome]]
+            alerts.append(
+                f"Dispersión destacada: {lift_outcome} {lift_price:.2f} "
+                f"({lift:.1f}% sobre mediana; no equivale a EV+)"
+            )
+        if (
+            best_ev is not None
+            and CONFIDENCE_RANK[best_confidence]
+            >= CONFIDENCE_RANK[minimum_confidence]
+            and best_ev >= ev_threshold
+        ):
+            ev_status = "🔥 EV+ con confianza"
+            alerts.append(
+                f"EV estimado {best_ev:.1f}% con confianza {best_confidence} "
+                f"(umbral {ev_threshold:.1f}%; no garantiza resultados)"
+            )
+        elif best_confidence == "Baja":
+            ev_status = "⚠️ Confianza baja"
+            alerts.append(
+                "EV sin alerta: confianza baja o menos de "
+                f"{MIN_QUOTES_PER_OUTCOME} cuotas para algún resultado."
+            )
+        elif best_ev is None:
+            ev_status = "N/D"
+        else:
+            ev_status = "❌ EV bajo el umbral"
+        if avg_margin > 7:
+            alerts.append(f"Margen medio alto: {avg_margin:.1f}%")
+        if suspicious_ev_outcomes:
+            alerts.append(
+                "EV superior al 50% excluido como cuota sospechosa: "
+                + ", ".join(suspicious_ev_outcomes)
+                + "."
+            )
+        if not alerts:
+            alerts.append("Sin alerta con los umbrales actuales")
+        output.append({
+            "event_id": event_id,
+            "Partido": f"{group[0]['Local']} vs {group[0]['Visitante']}",
+            "Inicio (UTC)": group[0]["Inicio (UTC)"],
+            "Casas": len(group),
+            "Overround calculado (%)": round(combined_best_overround, 4),
+            "Overround calibración (%)": round(median_overround, 2),
+            "Mejor EV estimado (%)": round(best_ev, 2) if best_ev is not None else None,
+            "EV%": round(best_ev, 2) if best_ev is not None else None,
+            "EV atípico descartado": bool(suspicious_ev_outcomes),
+            "Probabilidad estimada (%)": (
+                round(fair_probabilities[best_outcome] * 100, 2)
+                if best_outcome is not None
+                else None
+            ),
+            "Confianza mejor EV": best_confidence,
+            "Nivel de Confianza": best_confidence,
+            "Stake Kelly fraccional": round(kelly_stake, 2),
+            "Stake Kelly ($)": round(kelly_stake, 2),
+            "Casa con mejor cuota": best_offer["Casa"] if best_offer else "N/D",
+            "Casa mejor local": best_offers["Local"]["Casa"],
+            "Casa mejor empate": best_offers["Empate"]["Casa"],
+            "Casa mejor visitante": best_offers["Visitante"]["Casa"],
+            "Estado EV": ev_status,
+            "Alerta EV": "Sí" if ev_status == "🔥 EV+ con confianza" else "No",
+            "Overround medio (%)": round(avg_margin, 2),
+            "Cuota mediana local": round(median_odds["Local"], 3),
+            "Cuota mediana empate": round(median_odds["Empate"], 3),
+            "Cuota mediana visitante": round(median_odds["Visitante"], 3),
+            "Mejor local": visible_best_odds["Local"],
+            "Mejor empate": visible_best_odds["Empate"],
+            "Mejor visitante": visible_best_odds["Visitante"],
+            "Mayor diferencia vs mediana (%)": round(lift, 2),
+            "Prob. estimada local (%)": round(fair_probabilities["Local"] * 100, 2) if fair_probabilities["Local"] is not None else None,
+            "Prob. estimada empate (%)": round(fair_probabilities["Empate"] * 100, 2) if fair_probabilities["Empate"] is not None else None,
+            "Prob. estimada visitante (%)": round(fair_probabilities["Visitante"] * 100, 2) if fair_probabilities["Visitante"] is not None else None,
+            "Confianza local": confidence_levels["Local"],
+            "Consenso local (%)": consensus_percentages["Local"],
+            "Confianza empate": confidence_levels["Empate"],
+            "Consenso empate (%)": consensus_percentages["Empate"],
+            "Confianza visitante": confidence_levels["Visitante"],
+            "Consenso visitante (%)": consensus_percentages["Visitante"],
+            "EV local (%)": round(outcome_ev["Local"], 2) if outcome_ev["Local"] is not None else None,
+            "EV empate (%)": round(outcome_ev["Empate"], 2) if outcome_ev["Empate"] is not None else None,
+            "EV visitante (%)": round(outcome_ev["Visitante"], 2) if outcome_ev["Visitante"] is not None else None,
+            "Stake Kelly local ($)": round(outcome_stakes["Local"], 2),
+            "Stake Kelly empate ($)": round(outcome_stakes["Empate"], 2),
+            "Stake Kelly visitante ($)": round(outcome_stakes["Visitante"], 2),
+            "Selección con mayor EV": best_outcome or "N/D",
+            "Selección recomendada": (
+                best_outcome
+                if best_outcome is not None
+                and best_ev is not None
+                and best_ev >= ev_threshold
+                and CONFIDENCE_RANK[best_confidence]
+                >= CONFIDENCE_RANK[minimum_confidence]
+                else "Ninguna"
+            ),
+            "Alertas": "; ".join(alerts),
+        })
+    return output
+
+
+def generate_automatic_recommendations(
+    rows,
+    bankroll,
+    ev_threshold,
+    minimum_probability=40.0,
+    minimum_kelly_stake=1.0,
+    daily_stake_limit=0.20,
+    minimum_confidence="Media",
+):
+    outcome_fields = (
+        (
+            "Local",
+            "Mejor local",
+            "Prob. estimada local (%)",
+            "Confianza local",
+            "Stake Kelly local ($)",
+            "Casa mejor local",
+        ),
+        (
+            "Empate",
+            "Mejor empate",
+            "Prob. estimada empate (%)",
+            "Confianza empate",
+            "Stake Kelly empate ($)",
+            "Casa mejor empate",
+        ),
+        (
+            "Visitante",
+            "Mejor visitante",
+            "Prob. estimada visitante (%)",
+            "Confianza visitante",
+            "Stake Kelly visitante ($)",
+            "Casa mejor visitante",
+        ),
+    )
+    candidates_by_event = {}
+    marginal_lines = []
+    for match in rows:
+        candidates = []
+        for (
+            selection,
+            odds_key,
+            probability_key,
+            confidence_key,
+            stake_key,
+            bookmaker_key,
+        ) in outcome_fields:
+            probability = match.get(probability_key)
+            confidence = match.get(confidence_key, "Baja")
+            kelly_stake = match.get(stake_key, 0.0) or 0.0
+            if (
+                isinstance(probability, bool)
+                or not isinstance(probability, (int, float))
+            ):
+                continue
+            safe_ev = calcular_ev_seguro(
+                probability / 100,
+                match.get(odds_key),
+            )
+            if safe_ev is None:
+                continue
+            ev = safe_ev * 100
+            if ev <= 0:
+                continue
+            line = {
+                "Partido": match["Partido"],
+                "Inicio (UTC)": match.get("Inicio (UTC)", ""),
+                "event_id": match["event_id"],
+                "Selección": selection,
+                "Cuota": match[odds_key],
+                "Prob. estimada (%)": probability,
+                "EV%": ev,
+                "Confianza": confidence,
+                "Casa": match[bookmaker_key],
+                "Stake Kelly bruto ($)": kelly_stake,
+            }
+            eligible_confidence = (
+                confidence in CONFIDENCE_RANK
+                and CONFIDENCE_RANK[confidence]
+                >= CONFIDENCE_RANK[minimum_confidence]
+            )
+            meets_criteria = (
+                ev >= ev_threshold
+                and eligible_confidence
+                and probability >= minimum_probability
+                and kelly_stake >= minimum_kelly_stake
+            )
+            line["Cumple criterios"] = meets_criteria
+            if meets_criteria:
+                candidates.append(line)
+            else:
+                line["Motivo"] = "; ".join(
+                    reason
+                    for condition, reason in (
+                        (ev < ev_threshold, f"EV < {ev_threshold:.1f}%"),
+                        (
+                            not eligible_confidence,
+                            f"confianza inferior a {minimum_confidence}",
+                        ),
+                        (
+                            probability < minimum_probability,
+                            f"probabilidad < {minimum_probability:.0f}%",
+                        ),
+                        (
+                            kelly_stake < minimum_kelly_stake,
+                            f"Kelly < ${minimum_kelly_stake:.2f}",
+                        ),
+                    )
+                    if condition
+                )
+                marginal_lines.append(line)
+        if candidates:
+            candidates_by_event[match["event_id"]] = max(
+                candidates, key=lambda line: line["EV%"]
+            )
+
+    ordered_candidates = sorted(
+        candidates_by_event.values(),
+        key=lambda line: line["EV%"],
+        reverse=True,
+    )
+    remaining_daily_stake = max(0.0, bankroll * daily_stake_limit)
+    recommended_lines = []
+    for candidate in ordered_candidates:
+        allocated_stake = min(
+            candidate["Stake Kelly bruto ($)"],
+            remaining_daily_stake,
+        )
+        if allocated_stake < minimum_kelly_stake:
+            continue
+        recommended_line = dict(candidate)
+        recommended_line["Stake ($)"] = round(allocated_stake, 2)
+        recommended_lines.append(recommended_line)
+        remaining_daily_stake = max(0.0, remaining_daily_stake - allocated_stake)
+
+    combinations = []
+    if recommended_lines:
+        line = recommended_lines[0]
+        probability = line["Prob. estimada (%)"] / 100
+        simple_ev = calcular_ev_seguro(probability, line["Cuota"])
+        if simple_ev is not None:
+            combinations.append({
+                "Tipo": "SIMPLE",
+                "Selecciones": [line],
+                "Cuota combinada": line["Cuota"],
+                "Prob. estimada (%)": probability * 100,
+                "EV estimado (%)": simple_ev * 100,
+            })
+    for size, label in ((2, "DOBLE"), (3, "TRIPLE")):
+        if len(recommended_lines) < size:
+            continue
+        legs = recommended_lines[:size]
+        combined_odds = math.prod(line["Cuota"] for line in legs)
+        combined_probability = math.prod(
+            line["Prob. estimada (%)"] / 100 for line in legs
+        )
+        combined_ev = calculate_expected_value(
+            combined_probability,
+            combined_odds,
+        )
+        if (
+            not math.isfinite(combined_ev)
+            or combined_ev >= MAX_DISPLAYABLE_EV
+        ):
+            combined_ev = None
+        combinations.append({
+            "Tipo": label,
+            "Selecciones": legs,
+            "Cuota combinada": combined_odds,
+            "Prob. estimada (%)": combined_probability * 100,
+            "EV estimado (%)": combined_ev * 100 if combined_ev is not None else None,
+            "EV atípico descartado": combined_ev is None,
+        })
+
+    return recommended_lines, marginal_lines, combinations
+
+
+def _safe_svg_text(value):
+    return html.escape(str(value), quote=True)
+
+
+def build_recommendation_svg(recommendation):
+    details = (
+        ("Selección", recommendation["Selección"]),
+        ("Cuota", f"{recommendation['Cuota']:.2f}"),
+        ("Casa", recommendation["Casa"]),
+        ("EV estimado", f"{recommendation['EV%']:+.2f}%"),
+        ("Probabilidad estimada", f"{recommendation['Prob. estimada (%)']:.1f}%"),
+        ("Stake Kelly", f"${recommendation['Stake ($)']:.2f}"),
+    )
+    detail_lines = "".join(
+        f'<text x="56" y="{178 + index * 42}" fill="#dbeafe" '
+        f'font-size="21">{_safe_svg_text(label)}: '
+        f'{_safe_svg_text(value)}</text>'
+        for index, (label, value) in enumerate(details)
+    )
+    return (
+        '<svg xmlns="http://www.w3.org/2000/svg" width="900" height="500" '
+        'viewBox="0 0 900 500">'
+        '<rect width="900" height="500" rx="28" fill="#111827"/>'
+        '<rect x="24" y="24" width="852" height="452" rx="22" '
+        'fill="url(#card)" stroke="#475569"/>'
+        '<defs><linearGradient id="card" x1="0" y1="0" x2="1" y2="1">'
+        '<stop stop-color="#1e3a5f"/><stop offset="1" stop-color="#312e54"/>'
+        '</linearGradient></defs>'
+        '<text x="56" y="88" fill="#a5b4fc" font-size="20" '
+        'font-family="Arial,sans-serif">MARKET EFFICIENCY SCANNER</text>'
+        f'<text x="56" y="136" fill="white" font-size="30" font-weight="700" '
+        f'font-family="Arial,sans-serif">{_safe_svg_text(recommendation["Partido"])}</text>'
+        f'<g font-family="Arial,sans-serif">{detail_lines}</g>'
+        '<text x="56" y="447" fill="#94a3b8" font-size="15" '
+        'font-family="Arial,sans-serif">Estimaciones de mercado; no garantizan resultados.</text>'
+        '</svg>'
+    )
+
+
+def render_recommendation_export(recommendations):
+    if not recommendations:
+        return
+    st.download_button(
+        "🖼️ Descargar recomendación como imagen SVG",
+        data=build_recommendation_svg(recommendations[0]),
+        file_name="recomendacion_scanner.svg",
+        mime="image/svg+xml",
+        key="download_recommendation_svg",
+    )
+
+
+def render_next_value_countdown(recommendations):
+    now = datetime.now(timezone.utc)
+    upcoming = []
+    for line in recommendations:
+        kickoff = _parse_utc_datetime(line.get("Inicio (UTC)"))
+        if kickoff is not None and kickoff > now:
+            upcoming.append((line, kickoff))
+    if not upcoming:
+        st.info("No hay próximas oportunidades aptas según el perfil seleccionado.")
+        return
+
+    line, kickoff = max(upcoming, key=lambda item: item[0]["EV%"])
+    remaining = kickoff - now
+    total_minutes = int(remaining.total_seconds() // 60)
+    hours, minutes = divmod(total_minutes, 60)
+    days, hours = divmod(hours, 24)
+    remaining_text = f"{days}d {hours}h {minutes}m" if days else f"{hours}h {minutes}m"
+    st.markdown(
+        f"### ⏰ Próxima oportunidad por EV\n"
+        f"**{line['Partido']}** — {line['Selección']} @ {line['Cuota']:.2f} "
+        f"({line['Casa']})  \n"
+        f"Comienza en **{remaining_text}** · EV estimado: "
+        f"**{line['EV%']:+.2f}%** · Probabilidad estimada: "
+        f"**{line['Prob. estimada (%)']:.1f}%**"
+    )
+    st.caption(
+        f"Inicio: {kickoff.astimezone().strftime('%Y-%m-%d %H:%M %Z')}. "
+        "Se muestra la línea apta con mayor EV, no necesariamente la más próxima."
+    )
+
+
+def _escape_ics_text(value):
+    return (
+        str(value)
+        .replace("\\", "\\\\")
+        .replace(";", "\\;")
+        .replace(",", "\\,")
+        .replace("\r\n", "\\n")
+        .replace("\n", "\\n")
+    )
+
+
+def build_ics_calendar(recommendations):
+    lines = [
+        "BEGIN:VCALENDAR",
+        "VERSION:2.0",
+        "PRODID:-//Market Efficiency Scanner//EN",
+        "CALSCALE:GREGORIAN",
+    ]
+    for recommendation in recommendations:
+        kickoff = _parse_utc_datetime(recommendation.get("Inicio (UTC)"))
+        if kickoff is None:
+            continue
+        start = kickoff.strftime("%Y%m%dT%H%M%SZ")
+        lines.extend((
+            "BEGIN:VEVENT",
+            f"UID:{_escape_ics_text(recommendation['event_id'])}@market-scanner",
+            f"DTSTAMP:{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}",
+            f"DTSTART:{start}",
+            f"SUMMARY:{_escape_ics_text(recommendation['Partido'])}",
+            "DESCRIPTION:" + _escape_ics_text(
+                f"{recommendation['Selección']} @ {recommendation['Cuota']:.2f} "
+                f"({recommendation['Casa']}); EV estimado "
+                f"{recommendation['EV%']:+.2f}%; probabilidad estimada "
+                f"{recommendation['Prob. estimada (%)']:.1f}%"
+            ),
+            "END:VEVENT",
+        ))
+    lines.append("END:VCALENDAR")
+    return "\r\n".join(lines) + "\r\n"
+
+
+def render_recommendation_calendar(recommendations):
+    now = datetime.now(timezone.utc)
+    future_recommendations = []
+    for line in recommendations:
+        kickoff = _parse_utc_datetime(line.get("Inicio (UTC)"))
+        if kickoff is not None and kickoff > now:
+            future_recommendations.append(line)
+    if not future_recommendations:
+        st.info("No hay recomendaciones futuras para agregar al calendario.")
+        return
+    with st.expander("📅 Calendario de oportunidades"):
+        schedule = []
+        for line in sorted(
+            future_recommendations,
+            key=lambda item: _parse_utc_datetime(item["Inicio (UTC)"]),
+        ):
+            kickoff = _parse_utc_datetime(line["Inicio (UTC)"])
+            schedule.append({
+                "Inicio local": kickoff.astimezone().strftime("%Y-%m-%d %H:%M %Z"),
+                "Partido": line["Partido"],
+                "Selección": line["Selección"],
+                "Cuota": line["Cuota"],
+                "EV estimado (%)": line["EV%"],
+                "Casa": line["Casa"],
+            })
+        st.dataframe(pd.DataFrame(schedule), use_container_width=True, hide_index=True)
+        st.download_button(
+            "📥 Agregar oportunidades a mi calendario (.ics)",
+            data=build_ics_calendar(future_recommendations),
+            file_name="oportunidades_scanner.ics",
+            mime="text/calendar",
+            key="download_recommendation_calendar",
+        )
+
+
+def build_weekly_match_schedule(
+    rows,
+    quality_event_ids,
+    strategy_event_ids,
+    fecha_inicio=None,
+    fecha_fin=None,
+    now=None,
+):
+    """Calendario de partidos del rango elegido, en hora de Panamá (UTC-5)."""
+    panama = date_range.PANAMA_TZ
+    now = now or datetime.now(timezone.utc)
+    today = now.astimezone(panama).date()
+    if fecha_inicio is None:
+        fecha_inicio = today
+    if fecha_fin is None:
+        fecha_fin = fecha_inicio + timedelta(days=6)
+    grouped = {}
+    for row in rows:
+        event_id = row.get("event_id")
+        if event_id is None:
+            continue
+        grouped.setdefault(event_id, row)
+
+    schedule = []
+    for event_id, row in grouped.items():
+        kickoff = _parse_utc_datetime(row.get("Inicio (UTC)"))
+        if kickoff is None:
+            continue
+        local_kickoff = kickoff.astimezone(panama)
+        local_date = local_kickoff.date()
+        if not fecha_inicio <= local_date <= fecha_fin:
+            continue
+        if local_date == today:
+            day_label = f"HOY · {local_kickoff:%a %d %b}"
+        elif local_date == today + timedelta(days=1):
+            day_label = f"MAÑANA · {local_kickoff:%a %d %b}"
+        else:
+            day_label = f"{local_kickoff:%a %d %b}"
+        schedule.append({
+            "_kickoff": kickoff,
+            "Día": day_label,
+            "Fecha local": local_kickoff.strftime("%Y-%m-%d"),
+            "Hora local": local_kickoff.strftime("%H:%M") + " (Panamá)",
+            "Inicio local": local_kickoff.strftime("%a %d %b · %H:%M") + " (Panamá)",
+            "Partido": (
+                f"{row.get('Local') or 'Equipo local'} vs "
+                f"{row.get('Visitante') or 'Equipo visitante'}"
+            ),
+            "Mercado válido": event_id in quality_event_ids,
+            "Pasa filtros de estrategia": event_id in strategy_event_ids,
+        })
+    schedule.sort(key=lambda item: item["_kickoff"])
+    for item in schedule:
+        item.pop("_kickoff")
+    return schedule
+
+
+def render_sidebar_weekly_calendar(rows, quality_event_ids):
+    start, end = st.session_state.get("date_range_filter", (None, None))
+    schedule = build_weekly_match_schedule(
+        rows, quality_event_ids, set(), start, end
+    )
+    if not schedule:
+        st.warning("⚪ No hay partidos con cuotas válidas en el rango seleccionado.")
+        st.caption("Prueba cambiar el rango de fechas o actualizar las cuotas.")
+        return
+
+    grouped = {}
+    for match in schedule:
+        grouped.setdefault(match["Fecha local"], []).append(match)
+
+    for local_date, matches in grouped.items():
+        day_label = matches[0]["Día"]
+        st.markdown(f"**{day_label} · {len(matches)} partidos**")
+        for match in matches:
+            market_status = "✅" if match["Mercado válido"] else "⚪"
+            st.caption(
+                f"{match['Hora local']} · {match['Partido']} · {market_status}"
+            )
+        st.markdown("---")
+
+
+def render_weekly_match_calendar(rows, quality_event_ids, strategy_event_ids):
+    start, end = st.session_state.get("date_range_filter", (None, None))
+    schedule = build_weekly_match_schedule(
+        rows,
+        quality_event_ids,
+        strategy_event_ids,
+        start,
+        end,
+    )
+    with st.expander("🗓️ Calendario estratégico · rango elegido", expanded=True):
+        if not schedule:
+            st.info(
+                "No hay partidos con cuotas válidas en el rango de fechas. "
+                "Actualiza las cuotas para refrescar el calendario."
+            )
+            return
+        st.caption(
+            "Incluye todos los partidos con cuotas válidas. "
+            "«Mercado válido» indica que cumple calidad, mínimo de casas y "
+            "overround; «Pasa filtros de estrategia» aplica además EV, "
+            "confianza, probabilidad, stake y búsqueda de equipo."
+        )
+        st.dataframe(
+            pd.DataFrame(schedule),
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Mercado válido": st.column_config.CheckboxColumn(),
+                "Pasa filtros de estrategia": st.column_config.CheckboxColumn(),
+            },
+        )
+
+
+def render_bookmaker_comparison(rows, result_rows, theme):
+    if not rows or not result_rows:
+        return
+    event_labels = {row["event_id"]: row["Partido"] for row in result_rows}
+    with st.expander("🏦 Comparador visual de casas"):
+        selected_event = st.selectbox(
+            "Partido para comparar",
+            options=list(event_labels),
+            format_func=lambda event_id: event_labels[event_id],
+            key="bookmaker_comparison_event",
+        )
+        event_rows = [row for row in rows if row["event_id"] == selected_event]
+        if not event_rows:
+            st.info("No hay casas disponibles para este partido.")
+            return
+
+        event_rows.sort(
+            key=lambda row: calculate_overround(
+                row["Cuota local"],
+                row["Cuota empate"],
+                row["Cuota visitante"],
+            )
+        )
+        houses = [row["Casa"] for row in event_rows]
+        house_margins = {
+            row["Casa"]: calculate_overround(
+                row["Cuota local"],
+                row["Cuota empate"],
+                row["Cuota visitante"],
+            )
+            for row in event_rows
+        }
+        best_margin_house = min(house_margins, key=house_margins.get)
+        st.caption(
+            f"Menor overround del partido: {best_margin_house} "
+            f"({house_margins[best_margin_house]:.2f}%). "
+            "Las barras resaltadas indican la mejor cuota por selección."
+        )
+        selection_columns = {
+            "Local": "Cuota local",
+            "Empate": "Cuota empate",
+            "Visitante": "Cuota visitante",
+        }
+        colors = {"Local": "#00b894", "Empate": "#fdcb6e", "Visitante": "#e17055"}
+        best_by_selection = {
+            selection: max(row[column] for row in event_rows)
+            for selection, column in selection_columns.items()
+        }
+
+        figure = go.Figure()
+        for selection, column in selection_columns.items():
+            values = [row[column] for row in event_rows]
+            marker_colors = [
+                colors[selection] if price == best_by_selection[selection] else "rgba(148, 163, 184, 0.55)"
+                for price in values
+            ]
+            figure.add_trace(go.Bar(
+                name=selection,
+                y=houses,
+                x=values,
+                orientation="h",
+                marker_color=marker_colors,
+                text=[f"{value:.2f}" for value in values],
+                textposition="outside",
+                hovertemplate=(
+                    f"<b>{selection}</b><br>Casa: %{{y}}<br>"
+                    "Cuota: %{x:.2f}<br>"
+                    "Overround de la casa: %{customdata:.2f}%<extra></extra>"
+                ),
+                customdata=[house_margins[house] for house in houses],
+            ))
+
+        dark = theme == "Oscuro"
+        figure.update_layout(
+            title=f"Comparador de cuotas: {event_labels[selected_event]}",
+            barmode="group",
+            template="plotly_dark" if dark else "plotly_white",
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)",
+            font={"color": "#f8fafc" if dark else "#172033"},
+            height=min(800, max(420, 110 + len(houses) * 48)),
+            xaxis_title="Cuota decimal",
+            yaxis_title="Casa",
+            legend_title="Selección",
+            yaxis={"categoryorder": "array", "categoryarray": houses},
+            margin={"t": 60, "b": 25, "l": 15, "r": 25},
+        )
+        st.plotly_chart(figure, use_container_width=True)
+
+
+def prepare_simulation_events(history_rows, days=30, now=None):
+    current_time = now or datetime.now(timezone.utc)
+    cutoff = current_time - timedelta(days=days)
+    latest = {}
+    for row in history_rows:
+        kickoff = _parse_utc_datetime(row.get("Inicio (UTC)"))
+        snapshot = _parse_utc_datetime(row.get("Snapshot UTC"))
+        if kickoff is None or snapshot is None or not cutoff <= kickoff <= current_time:
+            continue
+        if snapshot >= kickoff:
+            continue
+        key = (
+            row.get("Competencia"),
+            row.get("Partido"),
+            row.get("Inicio (UTC)"),
+        )
+        if key not in latest or snapshot > latest[key][0]:
+            latest[key] = (snapshot, row)
+    events = []
+    for _, row in latest.values():
+        try:
+            ev = float(row["Mejor EV estimado (%)"])
+            probability = float(row["Probabilidad estimada (%)"]) / 100
+            odds = float(row[{
+                "Local": "Mejor local",
+                "Empate": "Mejor empate",
+                "Visitante": "Mejor visitante",
+            }[row["Selección con mayor EV"]]])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if (
+            ev <= 0
+            or not 0 < probability < 1
+            or odds <= 1
+            or row.get("Selección con mayor EV") not in {"Local", "Empate", "Visitante"}
+            or row.get("Confianza mejor EV") not in CONFIDENCE_RANK
+        ):
+            continue
+        events.append({
+            "Fecha": _parse_utc_datetime(row["Inicio (UTC)"]),
+            "Partido": row.get("Partido", ""),
+            "Selección": row["Selección con mayor EV"],
+            "Cuota": odds,
+            "EV%": ev,
+            "Probabilidad estimada": probability,
+            "Confianza": row["Confianza mejor EV"],
+        })
+    return sorted(events, key=lambda event: event["Fecha"])
+
+
+def simulate_historical_paths(
+    events, initial_bankroll=100.0, trials=1000, seed=42
+):
+    if initial_bankroll <= 0 or trials < 1:
+        raise ValueError("Bankroll y número de simulaciones deben ser positivos.")
+    rng = random.Random(seed)
+    final_balances = []
+    sample_path = []
+    for trial in range(trials):
+        balance = initial_bankroll
+        path = []
+        for event in events:
+            if balance <= 0:
+                break
+            stake = min(balance * 0.02, 5.0)
+            won = rng.random() < event["Probabilidad estimada"]
+            profit = stake * (event["Cuota"] - 1) if won else -stake
+            balance += profit
+            path.append({
+                "Fecha": event["Fecha"].astimezone().strftime("%Y-%m-%d"),
+                "Partido": event["Partido"],
+                "Selección": event["Selección"],
+                "Cuota": event["Cuota"],
+                "Resultado simulado": "Ganada" if won else "Perdida",
+                "Stake simulado ($)": round(stake, 2),
+                "Ganancia simulada ($)": round(profit, 2),
+                "Bankroll simulado ($)": round(balance, 2),
+            })
+        final_balances.append(balance)
+        if trial == 0:
+            sample_path = path
+    return final_balances, sample_path
+
+
+def render_historical_simulation(competition, ev_threshold, minimum_confidence):
+    if not HISTORY_PATH.exists():
+        return
+    try:
+        history_frame = pd.read_csv(HISTORY_PATH).fillna("")
+        history_rows = history_frame.to_dict(orient="records")
+        competition_rows = [
+            row for row in history_rows
+            if row.get("Competencia") == competition
+        ]
+        events = prepare_simulation_events(competition_rows)
+    except (OSError, pd.errors.ParserError, ValueError) as exc:
+        st.error(f"No se pudo preparar la simulación: {exc}")
+        return
+    events = [
+        event for event in events
+        if event["EV%"] >= ev_threshold
+        and CONFIDENCE_RANK[event["Confianza"]]
+        >= CONFIDENCE_RANK[minimum_confidence]
+    ]
+    if len(events) < 10:
+        return
+
+    with st.expander("🎮 Simulación Monte Carlo de los últimos 30 días"):
+        st.caption(
+            "No es un backtest de resultados reales. Cada partido se simula al azar "
+            "usando la probabilidad estimada guardada en el histórico; supone "
+            "independencia entre partidos, con stake simulado del 2% del bankroll "
+            "por evento y tope de $5. Solo ilustra incertidumbre."
+        )
+        controls = st.columns(3)
+        initial_bankroll = controls[0].number_input(
+            "Bankroll inicial de simulación ($)",
+            min_value=1.0,
+            value=100.0,
+            step=10.0,
+            key="simulation_initial_bankroll",
+        )
+        trials = controls[1].number_input(
+            "Escenarios Monte Carlo",
+            min_value=100,
+            max_value=10000,
+            value=1000,
+            step=100,
+            key="simulation_trials",
+        )
+        seed = controls[2].number_input(
+            "Semilla reproducible",
+            min_value=0,
+            max_value=2147483647,
+            value=42,
+            step=1,
+            key="simulation_seed",
+        )
+        if st.button("▶️ Ejecutar simulación", key="run_historical_simulation"):
+            try:
+                balances, sample_path = simulate_historical_paths(
+                    events,
+                    initial_bankroll=float(initial_bankroll),
+                    trials=int(trials),
+                    seed=int(seed),
+                )
+                st.session_state["historical_simulation_result"] = (
+                    competition,
+                    ev_threshold,
+                    minimum_confidence,
+                    balances,
+                    sample_path,
+                )
+            except ValueError as exc:
+                st.error(f"No se pudo ejecutar la simulación: {exc}")
+        simulation = st.session_state.get("historical_simulation_result")
+        if not simulation or simulation[:3] != (
+            competition, ev_threshold, minimum_confidence
+        ):
+            return
+        _, _, _, balances, sample_path = simulation
+        roi_values = [
+            (balance / initial_bankroll - 1) * 100 for balance in balances
+        ]
+        metrics = st.columns(4)
+        metrics[0].metric("Partidos simulados", len(events))
+        metrics[1].metric("ROI medio", f"{statistics.mean(roi_values):+.2f}%")
+        metrics[2].metric("ROI mediano", f"{statistics.median(roi_values):+.2f}%")
+        metrics[3].metric(
+            "Escenarios con pérdida",
+            f"{sum(roi < 0 for roi in roi_values) / len(roi_values):.1%}",
+        )
+        histogram = px.histogram(
+            pd.DataFrame({"ROI simulado (%)": roi_values}),
+            x="ROI simulado (%)",
+            nbins=40,
+            title="Distribución de ROI simulado",
+        )
+        dark = st.session_state.get("app_theme", "Oscuro") == "Oscuro"
+        histogram.update_layout(
+            template="plotly_dark" if dark else "plotly_white",
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)",
+            font={"color": "#f8fafc" if dark else "#172033"},
+        )
+        st.plotly_chart(histogram, use_container_width=True)
+        with st.expander("Ver un escenario simulado"):
+            st.dataframe(pd.DataFrame(sample_path), use_container_width=True, hide_index=True)
+
+
+def render_automatic_recommendations(
+    rows,
+    bankroll,
+    ev_threshold,
+    minimum_probability=40.0,
+    minimum_kelly_stake=1.0,
+    daily_stake_limit=0.20,
+    minimum_confidence="Media",
+):
+    recommended, marginal, combinations = generate_automatic_recommendations(
+        rows,
+        bankroll,
+        ev_threshold,
+        minimum_probability=minimum_probability,
+        minimum_kelly_stake=minimum_kelly_stake,
+        daily_stake_limit=daily_stake_limit,
+        minimum_confidence=minimum_confidence,
+    )
+    st.subheader("🎯 Recomendaciones Automáticas")
+    total_stake = sum(line["Stake ($)"] for line in recommended)
+    best_ev = max((line["EV%"] for line in recommended), default=None)
+    indicator = "🟢" if recommended else "🟡"
+    metric_columns = st.columns(4)
+    metric_columns[0].metric("Decisión", f"{indicator} {'Líneas aptas' if recommended else 'Sin líneas aptas'}")
+    metric_columns[1].metric("Líneas aptas", len(recommended))
+    metric_columns[2].metric(
+        "Mejor EV filtrado",
+        f"{best_ev:+.2f}%" if best_ev is not None else "N/D",
+    )
+    metric_columns[3].metric(
+        "Stake individual total",
+        f"${total_stake:.2f} / ${bankroll * daily_stake_limit:.2f}",
+    )
+    st.caption(
+        f"Criterios: EV ≥ {ev_threshold:.1f}% · "
+        f"confianza {minimum_confidence} o superior · "
+        f"probabilidad estimada ≥ {minimum_probability:.0f}% · "
+        f"Kelly ≥ ${minimum_kelly_stake:.2f}. "
+        f"El stake total de las líneas individuales se limita al "
+        f"{daily_stake_limit:.0%} del bankroll."
+    )
+    if not recommended:
+        st.info("No se recomienda ninguna línea con los filtros actuales.")
+
+    if recommended:
+        st.markdown("#### 📋 Líneas individuales que cumplen todos los criterios")
+        display_columns = (
+            "Partido",
+            "Selección",
+            "Cuota",
+            "Prob. estimada (%)",
+            "EV%",
+            "Confianza",
+            "Casa",
+            "Stake ($)",
+        )
+        st.dataframe(
+            [{column: line[column] for column in display_columns} for line in recommended],
+            use_container_width=True,
+            hide_index=True,
+        )
+        if combinations:
+            st.markdown("#### 🎲 Combinadas simuladas")
+            st.caption(
+                "Son escenarios matemáticos, no recomendaciones. La probabilidad "
+                "combinada multiplica probabilidades individuales y supone "
+                "independencia entre partidos; no se asigna stake Kelly adicional."
+            )
+            for combination in combinations:
+                selections = " + ".join(
+                    f"{line['Partido']} — {line['Selección']} @ {line['Cuota']:.2f}"
+                    for line in combination["Selecciones"]
+                )
+                combination_ev = combination["EV estimado (%)"]
+                ev_label = (
+                    f"{combination_ev:+.2f}%"
+                    if combination_ev is not None
+                    else "N/D (EV ≥ 50% excluido)"
+                )
+                st.markdown(
+                    f"**{combination['Tipo']}** · Cuota combinada "
+                    f"{combination['Cuota combinada']:.2f} · Prob. estimada "
+                    f"{combination['Prob. estimada (%)']:.2f}% · EV estimado "
+                    f"{ev_label}<br>{selections}",
+                    unsafe_allow_html=True,
+                )
+    else:
+        st.warning(
+            f"No hay líneas que cumplan todos los criterios. "
+            f"No apostar hoy; preservar bankroll de ${bankroll:.2f}."
+        )
+
+    if marginal:
+        st.markdown("#### ⚠️ Líneas marginales (no cumplen todos los criterios)")
+        marginal_columns = (
+            "Partido",
+            "Selección",
+            "Cuota",
+            "Prob. estimada (%)",
+            "EV%",
+            "Confianza",
+            "Casa",
+            "Stake Kelly bruto ($)",
+            "Motivo",
+        )
+        st.dataframe(
+            [
+                {column: line[column] for column in marginal_columns}
+                for line in sorted(marginal, key=lambda line: line["EV%"], reverse=True)
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+    st.warning(
+        "Estimaciones basadas en cuotas de mercado, no probabilidades reales ni "
+        "garantías. EV positivo no asegura resultados en una apuesta; no persigas "
+        "pérdidas y mantén disciplina. Las combinadas elevan la varianza."
+    )
+    return recommended, marginal, combinations
+
+
+def load_personal_bets(path=BET_TRACKER_PATH):
+    if not path.exists():
+        return []
+    with path.open("r", newline="", encoding="utf-8") as bet_file:
+        reader = csv.DictReader(bet_file)
+        required = set(PERSONAL_BET_FIELDS) - OPTIONAL_BET_FIELDS
+        if not required.issubset(reader.fieldnames or []):
+            raise ValueError("El CSV de apuestas no tiene el formato esperado.")
+        bets = list(reader)
+    for bet in bets:
+        bet.setdefault("Cuota cierre", "")
+        bet.setdefault("CLV (%)", "")
+        closing_odds = bet["Cuota cierre"] or ""
+        if closing_odds.strip():
+            try:
+                closing_valid = cuota_valida(float(closing_odds))
+            except ValueError:
+                closing_valid = False
+            if not closing_valid:
+                raise ValueError("El CSV de apuestas contiene una cuota de cierre inválida.")
+        try:
+            odds = float(bet["Cuota"])
+            stake = float(bet["Stake ($)"])
+            expected_value = float(bet["EV estimado (%)"])
+            probability = float(bet["Prob. estimada (%)"])
+            net_profit = (
+                float(bet["Ganancia neta ($)"])
+                if bet["Resultado"] in {"Ganada", "Perdida"}
+                else 0.0
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("El CSV de apuestas contiene valores no numéricos.") from exc
+        if (
+            not all(
+                math.isfinite(value)
+                for value in (odds, stake, expected_value, probability, net_profit)
+            )
+            or odds <= 1
+            or stake <= 0
+            or not -100 <= expected_value <= 1000
+            or not 0 <= probability <= 100
+            or bet["Resultado"] not in {"Pendiente", "Ganada", "Perdida"}
+        ):
+            raise ValueError("El CSV de apuestas contiene valores fuera de rango.")
+    return bets
+
+
+def save_personal_bet(bet, path=BET_TRACKER_PATH):
+    _append_csv_records(path, [bet], list(PERSONAL_BET_FIELDS))
+
+
+def save_recommended_bet(recommendation, competition):
+    stake = float(recommendation["Stake ($)"])
+    if stake <= 0:
+        raise ValueError("La recomendación no tiene un stake válido.")
+    new_bet = {
+        "ID": str(uuid.uuid4()),
+        "Fecha UTC": datetime.now(timezone.utc).isoformat(),
+        "Competencia": competition,
+        "Partido": recommendation["Partido"],
+        "Selección": recommendation["Selección"],
+        "Cuota": f"{float(recommendation['Cuota']):.2f}",
+        "Stake ($)": f"{stake:.2f}",
+        "EV estimado (%)": f"{float(recommendation['EV%']):.2f}",
+        "Prob. estimada (%)": (
+            f"{float(recommendation['Prob. estimada (%)']):.2f}"
+        ),
+        "Resultado": "Pendiente",
+        "Ganancia neta ($)": "",
+    }
+    save_personal_bet(new_bet)
+
+
+def save_combination_bet(combo, competition):
+    stake = float(combo["Stake sugerido ($)"])
+    if stake <= 0:
+        raise ValueError("La combinada no tiene un stake válido.")
+    legs = combo["Selecciones"]
+    match_label = f"{combo['Tipo']}: " + " + ".join(leg["Partido"] for leg in legs)
+    selection_label = " | ".join(
+        f"{leg['Selección']} @ {float(leg['Cuota']):.2f}" for leg in legs
+    )
+    for bet in load_personal_bets():
+        if (
+            bet["Resultado"] == "Pendiente"
+            and bet["Partido"] == match_label
+            and bet["Selección"] == selection_label
+        ):
+            raise ValueError("Esta combinada ya está registrada como pendiente.")
+    save_personal_bet({
+        "ID": str(uuid.uuid4()),
+        "Fecha UTC": datetime.now(timezone.utc).isoformat(),
+        "Competencia": competition,
+        "Partido": match_label,
+        "Selección": selection_label,
+        "Cuota": f"{float(combo['Cuota combinada']):.2f}",
+        "Stake ($)": f"{stake:.2f}",
+        "EV estimado (%)": f"{float(combo['EV estimado (%)']):.2f}",
+        "Prob. estimada (%)": f"{float(combo['Prob. estimada (%)']):.2f}",
+        "Resultado": "Pendiente",
+        "Ganancia neta ($)": "",
+    })
+
+
+def settle_personal_bet(bet_id, result, path=BET_TRACKER_PATH):
+    if result not in {"Ganada", "Perdida"}:
+        raise ValueError("El resultado debe ser Ganada o Perdida.")
+    bets = load_personal_bets(path)
+    matching_bets = [
+        bet for bet in bets
+        if bet["ID"] == bet_id and bet["Resultado"] == "Pendiente"
+    ]
+    if not matching_bets:
+        raise ValueError("No se encontró una apuesta pendiente con ese ID.")
+
+    bet = matching_bets[0]
+    stake = float(bet["Stake ($)"])
+    odds = float(bet["Cuota"])
+    bet["Resultado"] = result
+    bet["Ganancia neta ($)"] = (
+        round(stake * (odds - 1), 2) if result == "Ganada" else round(-stake, 2)
+    )
+
+    _write_personal_bets(bets, path)
+
+
+def _write_personal_bets(bets, path):
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            newline="",
+            encoding="utf-8",
+            dir=path.parent,
+            delete=False,
+        ) as temporary_file:
+            temporary_path = Path(temporary_file.name)
+            writer = csv.DictWriter(
+                temporary_file,
+                fieldnames=PERSONAL_BET_FIELDS,
+                extrasaction="ignore",
+            )
+            writer.writeheader()
+            writer.writerows(bets)
+        os.replace(temporary_path, path)
+    except OSError:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+        raise
+
+
+def set_closing_odds(bet_id, closing_odds, path=BET_TRACKER_PATH):
+    """Guarda la cuota de cierre y el CLV de una apuesta (pendiente o liquidada)."""
+    if not cuota_valida(closing_odds):
+        raise ValueError("La cuota de cierre debe ser un número válido.")
+    bets = load_personal_bets(path)
+    bet = next((item for item in bets if item["ID"] == bet_id), None)
+    if bet is None:
+        raise ValueError("No se encontró una apuesta con ese ID.")
+    clv = calculate_clv(float(bet["Cuota"]), float(closing_odds))
+    if clv is None:
+        raise ValueError("No se pudo calcular el CLV con esas cuotas.")
+    bet["Cuota cierre"] = f"{float(closing_odds):.2f}"
+    bet["CLV (%)"] = f"{clv:.2f}"
+    _write_personal_bets(bets, path)
+    return clv
+
+
+def render_personal_bet_tracker():
+    try:
+        bets = load_personal_bets()
+    except (OSError, csv.Error, ValueError) as exc:
+        st.error(f"No se pudo leer el tracker de apuestas: {exc}")
+        return
+
+    settled = [
+        bet for bet in bets if bet["Resultado"] in {"Ganada", "Perdida"}
+    ]
+    pending = [bet for bet in bets if bet["Resultado"] == "Pendiente"]
+    total_stake = sum(float(bet["Stake ($)"]) for bet in settled)
+    net_profit = sum(float(bet["Ganancia neta ($)"]) for bet in settled)
+    expected_profit = sum(
+        float(bet["Stake ($)"]) * float(bet["EV estimado (%)"]) / 100
+        for bet in settled
+    )
+    wins = sum(bet["Resultado"] == "Ganada" for bet in settled)
+    win_rate = wins / len(settled) * 100 if settled else 0.0
+    roi = net_profit / total_stake * 100 if total_stake else 0.0
+
+    metrics = st.columns(5)
+    metrics[0].metric("Apuestas", len(bets))
+    metrics[1].metric("Pendientes", len(pending))
+    metrics[2].metric("Win rate liquidado", f"{win_rate:.1f}%")
+    metrics[3].metric("ROI liquidado", f"{roi:+.2f}%")
+    metrics[4].metric("Beneficio neto", f"${net_profit:+.2f}")
+    if settled:
+        st.caption(
+            f"Beneficio esperado según EV registrado: ${expected_profit:+.2f} · "
+            f"real: ${net_profit:+.2f} · diferencia: "
+            f"${net_profit - expected_profit:+.2f}."
+        )
+
+    clv_values = [
+        float(bet["CLV (%)"]) for bet in bets if (bet.get("CLV (%)") or "").strip()
+    ]
+    if clv_values:
+        average_clv = sum(clv_values) / len(clv_values)
+        st.caption(
+            f"CLV promedio: {average_clv:+.2f}% en {len(clv_values)} apuestas con "
+            "cuota de cierre. Un CLV positivo sostenido indica que tomaste "
+            "mejores precios que el cierre del mercado."
+        )
+
+    if bets:
+        with st.form("closing_odds_form"):
+            bets_by_label = {
+                f"{bet['Partido']} — {bet['Selección']} @ {float(bet['Cuota']):.2f} "
+                f"· #{bet['ID'][:8]}": bet["ID"]
+                for bet in bets
+            }
+            selected_label = st.selectbox(
+                "Apuesta", list(bets_by_label), key="closing_odds_bet"
+            )
+            closing_odds = st.number_input(
+                "Cuota de cierre",
+                min_value=1.01,
+                max_value=MAX_ODDS,
+                value=2.00,
+                step=0.01,
+                key="closing_odds_value",
+            )
+            save_closing = st.form_submit_button("📈 Registrar cuota de cierre")
+        if save_closing:
+            try:
+                clv = set_closing_odds(bets_by_label[selected_label], closing_odds)
+                st.success(f"CLV registrado: {clv:+.2f}%.")
+                st.rerun()
+            except (OSError, csv.Error, ValueError) as exc:
+                st.error(f"No se pudo registrar la cuota de cierre: {exc}")
+
+    if pending:
+        with st.form("settle_personal_bet_form"):
+            pending_bets = {
+                f"{bet['Partido']} — {bet['Selección']} @ {float(bet['Cuota']):.2f} "
+                f"· ${float(bet['Stake ($)']):.2f} · #{bet['ID'][:8]}": bet["ID"]
+                for bet in pending
+            }
+            selected_bet = st.selectbox(
+                "Apuesta pendiente", list(pending_bets),
+                key="personal_bet_to_settle",
+            )
+            result = st.radio(
+                "Resultado final", ("Ganada", "Perdida"),
+                horizontal=True, key="personal_bet_result",
+            )
+            settle = st.form_submit_button("✅ Liquidar apuesta")
+        if settle:
+            try:
+                settle_personal_bet(pending_bets[selected_bet], result)
+                st.success("Apuesta liquidada.")
+                st.rerun()
+            except (OSError, csv.Error, ValueError) as exc:
+                st.error(f"No se pudo liquidar la apuesta: {exc}")
+
+    display_bets = [
+        {key: value for key, value in bet.items() if key != "ID"}
+        for bet in bets
+    ]
+    st.dataframe(pd.DataFrame(display_bets), use_container_width=True, hide_index=True)
+
+
+def render_today_opportunities(
+    matches,
+    recommendations,
+    competition,
+    odds_rows,
+    history_rows,
+    h2h_loader=None,
+    weather_loader=None,
+    max_cards=10,
+):
+    panama = date_range.PANAMA_TZ
+    now = datetime.now(timezone.utc)
+    start, end = st.session_state.get(
+        "date_range_filter", (None, None)
+    )
+    if start is None:
+        start = end = date_range.today_panama(now)
+    if st.session_state.get("date_mode") == "Hoy" or start == end == date_range.today_panama(now):
+        st.header(f"📅 Oportunidades de hoy ({start:%d/%m/%Y})")
+    else:
+        st.header(f"📅 Oportunidades ({start:%d/%m} - {end:%d/%m/%Y})")
+    st.caption(
+        "Estimaciones basadas en el mercado, no probabilidades reales ni "
+        "garantía de rentabilidad. Revisa siempre la cuota antes de apostar. "
+        "Horario de Panamá."
+    )
+    upcoming_matches = []
+    selected_matches = []
+    for match in matches:
+        kickoff = _parse_utc_datetime(match.get("Inicio (UTC)"))
+        if kickoff is None or kickoff <= now:
+            continue
+        upcoming_matches.append((kickoff, match))
+        if start <= kickoff.astimezone(panama).date() <= end:
+            selected_matches.append((kickoff, match))
+    selected_matches.sort(key=lambda item: item[0])
+
+    if not selected_matches:
+        st.info(
+            f"⚪ No hay partidos próximos en el rango seleccionado "
+            f"({start:%d/%m} - {end:%d/%m}). "
+            "Conservar el bankroll también es una decisión."
+        )
+        if upcoming_matches:
+            next_kickoff, next_match = min(upcoming_matches, key=lambda item: item[0])
+            st.caption(
+                f"Próximo partido: {next_match['Partido']} · "
+                f"{next_kickoff.astimezone(panama):%a %d %b, %H:%M} (Panamá)."
+            )
+        return
+
+    recommendation_by_event = {
+        recommendation["event_id"]: recommendation
+        for recommendation in recommendations
+    }
+    if not recommendations:
+        st.info(
+            "Ningún partido cumple todos los filtros de recomendación. "
+            "Las tarjetas siguientes son solo comparación de mercado."
+        )
+    for _, match in selected_matches[:max_cards]:
+        match_recommendation = recommendation_by_event.get(match["event_id"])
+        match_odds = [
+            row for row in odds_rows if row.get("event_id") == match["event_id"]
+        ]
+        render_card_pro(
+            match,
+            recommendation=match_recommendation,
+            odds_rows=match_odds,
+            history_rows=history_rows,
+            h2h_loader=h2h_loader,
+            weather_loader=weather_loader,
+            on_register=(
+                lambda item: save_recommended_bet(item, competition)
+            )
+            if match_recommendation is not None
+            else None,
+        )
+    if len(selected_matches) > max_cards:
+        st.caption(
+            f"Se muestran los {max_cards} próximos partidos de "
+            f"{len(selected_matches)} en el rango seleccionado."
+        )
+
+
+def render_bet_history():
+    try:
+        bets = load_personal_bets()
+    except (OSError, csv.Error, ValueError) as exc:
+        st.error(f"No se pudo leer el historial de apuestas: {exc}")
+        return False
+    if not bets:
+        return False
+
+    st.subheader("Apuestas registradas")
+    render_personal_bet_tracker()
+    settled = [bet for bet in bets if bet["Resultado"] in {"Ganada", "Perdida"}]
+    if len(settled) >= 10:
+        history = pd.DataFrame(settled)
+        history["Fecha UTC"] = pd.to_datetime(
+            history["Fecha UTC"], utc=True, errors="coerce"
+        )
+        history["Ganancia neta ($)"] = pd.to_numeric(
+            history["Ganancia neta ($)"], errors="coerce"
+        )
+        history = history.dropna(
+            subset=["Fecha UTC", "Ganancia neta ($)"]
+        ).sort_values("Fecha UTC")
+        if len(history) >= 10:
+            history["Beneficio acumulado ($)"] = history[
+                "Ganancia neta ($)"
+            ].cumsum()
+            figure = px.line(
+                history,
+                x="Fecha UTC",
+                y="Beneficio acumulado ($)",
+                title="Beneficio neto acumulado",
+                markers=True,
+            )
+            st.plotly_chart(figure, use_container_width=True)
+    return True
+
+
+def is_overround_outlier(row):
+    return any(
+        row[column] > MAX_EVENT_OVERROUND_PERCENT
+        for column in (
+            "Overround medio (%)",
+            "Overround calibración (%)",
+            "Overround calculado (%)",
+        )
+    )
+
+
+def passes_quality_filter(row, min_books, max_margin):
+    maximum_margin = min(max_margin, MAX_EVENT_OVERROUND_PERCENT)
+    return (
+        row["Casas"] >= min_books
+        and 0 <= row["Overround medio (%)"] <= maximum_margin
+        and 0 <= row["Overround calibración (%)"] <= maximum_margin
+        and row["Overround calculado (%)"] <= MAX_EVENT_OVERROUND_PERCENT
+    )
+
+
+def append_history_snapshot(
+    sport_key,
+    events,
+    edge_threshold,
+    bankroll,
+    kelly_fraction,
+    ev_threshold,
+    minimum_confidence="Media",
+):
+    rows = flatten_events(events)
+    if not rows:
+        return 0
+
+    snapshot_at = datetime.now(timezone.utc).isoformat()
+    summaries = summarize_events(
+        rows,
+        edge_threshold,
+        bankroll=bankroll,
+        kelly_fraction=kelly_fraction,
+        ev_threshold=ev_threshold,
+        minimum_confidence=minimum_confidence,
+    )
+    history_rows = [
+        {
+            "Snapshot UTC": snapshot_at,
+            "Competencia": sport_key,
+            **{key: value for key, value in summary.items() if key != "event_id"},
+        }
+        for summary in summaries
+    ]
+    fieldnames = list(history_rows[0])
+    _append_csv_records(HISTORY_PATH, history_rows, fieldnames)
+
+    safe_sport_key = "".join(
+        char if char.isalnum() or char in "-_" else "_"
+        for char in sport_key
+    )
+    daily_history_path = HISTORY_PATH.with_name(
+        f"historico_{safe_sport_key}_{snapshot_at[:10].replace('-', '')}.csv"
+    )
+    _append_csv_records(daily_history_path, history_rows, fieldnames)
+    return len(history_rows)
+
+
+def _append_csv_records(path, records, fieldnames):
+    file_exists = path.exists() and path.stat().st_size > 0
+    if file_exists:
+        with path.open("r", newline="", encoding="utf-8") as history_file:
+            existing_fieldnames = next(csv.reader(history_file), [])
+        if existing_fieldnames != fieldnames:
+            temporary_path = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    mode="w",
+                    newline="",
+                    encoding="utf-8",
+                    dir=path.parent,
+                    delete=False,
+                ) as temporary_file:
+                    temporary_path = Path(temporary_file.name)
+                    writer = csv.DictWriter(
+                        temporary_file,
+                        fieldnames=fieldnames,
+                        extrasaction="ignore",
+                    )
+                    writer.writeheader()
+                    with path.open("r", newline="", encoding="utf-8") as history_file:
+                        reader = csv.DictReader(history_file)
+                        writer.writerows(reader)
+                    writer.writerows(records)
+                os.replace(temporary_path, path)
+            except OSError:
+                if temporary_path is not None:
+                    temporary_path.unlink(missing_ok=True)
+                raise
+        else:
+            with path.open("a", newline="", encoding="utf-8") as history_file:
+                csv.DictWriter(
+                    history_file, fieldnames=fieldnames
+                ).writerows(records)
+    else:
+        with path.open("w", newline="", encoding="utf-8") as history_file:
+            writer = csv.DictWriter(history_file, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(records)
+
+
+def _parse_utc_datetime(value):
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        try:
+            parsed = datetime.strptime(
+                value.replace("Z", "+00:00"),
+                "%Y-%m-%dT%H:%M:%S.%f%z",
+            )
+        except ValueError:
+            return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def build_backtest_template(history_rows):
+    latest_rows = {}
+    for row in history_rows:
+        kickoff = _parse_utc_datetime(row.get("Inicio (UTC)"))
+        snapshot = _parse_utc_datetime(row.get("Snapshot UTC"))
+        if kickoff is None or snapshot is None or snapshot >= kickoff:
+            continue
+        key = (
+            row.get("Competencia"),
+            row.get("Partido"),
+            row.get("Inicio (UTC)"),
+        )
+        if key not in latest_rows or snapshot > latest_rows[key][0]:
+            latest_rows[key] = (snapshot, row)
+
+    template = []
+    for _, row in latest_rows.values():
+        template.append({
+            "Competencia": row.get("Competencia", ""),
+            "Partido": row.get("Partido", ""),
+            "Inicio (UTC)": row.get("Inicio (UTC)", ""),
+            "Snapshot UTC": row.get("Snapshot UTC", ""),
+            "Resultado real (Local/Empate/Visitante)": "",
+        })
+    return template
+
+
+def calculate_backtest(
+    history_rows, result_rows, ev_threshold, minimum_confidence="Media"
+):
+    results_by_key = {
+        (
+            row.get("Competencia"),
+            row.get("Partido"),
+            row.get("Inicio (UTC)"),
+            row.get("Snapshot UTC"),
+            ): (
+                row.get("Resultado real (Local/Empate/Visitante)", "").strip().casefold()
+                if isinstance(
+                    row.get("Resultado real (Local/Empate/Visitante)", ""), str
+                )
+                else ""
+            )
+            for row in result_rows
+    }
+    accepted_results = {
+        "local": "Local",
+        "empate": "Empate",
+        "visitante": "Visitante",
+    }
+    bets = []
+    latest_by_event = {}
+    for row in history_rows:
+        kickoff = _parse_utc_datetime(row.get("Inicio (UTC)"))
+        snapshot = _parse_utc_datetime(row.get("Snapshot UTC"))
+        if kickoff is None or snapshot is None or snapshot >= kickoff:
+            continue
+        key = (
+            row.get("Competencia"),
+            row.get("Partido"),
+            row.get("Inicio (UTC)"),
+        )
+        if key not in latest_by_event or snapshot > latest_by_event[key][0]:
+            latest_by_event[key] = (snapshot, row)
+
+    for _, row in latest_by_event.values():
+        key = (
+            row.get("Competencia"),
+            row.get("Partido"),
+            row.get("Inicio (UTC)"),
+            row.get("Snapshot UTC"),
+        )
+        actual_result = results_by_key.get(key)
+        selection = row.get("Selección con mayor EV", "")
+        try:
+            expected_value = float(row.get("Mejor EV estimado (%)", ""))
+            stake = float(row.get("Stake Kelly fraccional", ""))
+            selected_odds_column = {
+                "Local": "Mejor local",
+                "Empate": "Mejor empate",
+                "Visitante": "Mejor visitante",
+            }[selection]
+            selected_odds = float(row[selected_odds_column])
+        except (KeyError, TypeError, ValueError):
+            continue
+        confidence = row.get("Confianza mejor EV", "")
+        actual_result = accepted_results.get(actual_result)
+        if (
+            actual_result is None
+            or CONFIDENCE_RANK.get(confidence, -1)
+            < CONFIDENCE_RANK[minimum_confidence]
+            or expected_value < ev_threshold
+            or stake <= 0
+            or selected_odds <= 1
+        ):
+            continue
+
+        won = selection == actual_result
+        profit = stake * (selected_odds - 1) if won else -stake
+        bets.append({
+            "Partido": row.get("Partido", ""),
+            "Selección": selection,
+            "Resultado real": actual_result,
+            "EV estimado (%)": expected_value,
+            "Cuota": selected_odds,
+            "Stake": stake,
+            "Ganancia neta": round(profit, 2),
+            "Resultado": "Ganada" if won else "Perdida",
+        })
+
+    stake_total = sum(bet["Stake"] for bet in bets)
+    profit_total = sum(bet["Ganancia neta"] for bet in bets)
+    roi = profit_total / stake_total * 100 if stake_total else None
+    return bets, stake_total, profit_total, roi
+
+
+def render_metrics_dashboard(rows):
+    available_ev = [
+        row["Mejor EV estimado (%)"]
+        for row in rows
+        if row["Mejor EV estimado (%)"] is not None
+        and row["Confianza mejor EV"] in {"Alta", "Media"}
+    ]
+    positive_ev_count = sum(value > 0 for value in available_ev)
+    best_ev = max(available_ev) if available_ev else None
+    average_overround = (
+        statistics.mean(row["Overround medio (%)"] for row in rows)
+        if rows
+        else None
+    )
+
+    metrics = [
+        ("PARTIDOS ANALIZADOS", str(len(rows)), "Eventos tras filtros de calidad"),
+        (
+            "EV+ · CONFIANZA MEDIA/ALTA",
+            str(positive_ev_count),
+            "Oportunidades con estimación disponible",
+        ),
+        (
+            "MEJOR EV ESTIMADO",
+            f"{best_ev:+.2f}%" if best_ev is not None else "N/D",
+            "Mejor línea con confianza media o alta",
+        ),
+        (
+            "OVERROUND MEDIO POR CASA",
+            f"{average_overround:.2f}%"
+            if average_overround is not None
+            else "N/D",
+            "Margen promedio del mercado",
+        ),
+    ]
+    columns = st.columns(4)
+    for column, (label, value, footnote) in zip(columns, metrics):
+        with column:
+            st.markdown(
+                f"""
+                <div class="terminal-kpi">
+                    <div class="terminal-kpi-label">{html.escape(label)}</div>
+                    <div class="terminal-kpi-value">
+                        {html.escape(value)}
+                    </div>
+                    <div class="terminal-kpi-foot">{html.escape(footnote)}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+
+def get_ev_badge(ev, qualifies_threshold):
+    if ev is None:
+        return "N/D", "ev-negative"
+    if not qualifies_threshold:
+        return f"❌ {ev:+.2f}%", "ev-negative"
+    if ev > 10:
+        return f"🔥 {ev:+.2f}%", "ev-positive"
+    if ev > 5:
+        return f"⚡ {ev:+.2f}%", "ev-moderate"
+    if ev >= 0:
+        return f"✅ {ev:+.2f}%", "ev-positive"
+    return f"❌ {ev:+.2f}%", "ev-negative"
+
+
+def get_confidence_badge(confidence):
+    badge_class = {
+        "Alta": "confidence-high",
+        "Media": "confidence-medium",
+        "Baja": "confidence-low",
+    }.get(confidence, "confidence-low")
+    return badge_class
+
+
+def render_analysis_charts(rows, theme="Oscuro"):
+    if not rows:
+        st.info("No hay partidos para construir los gráficos con los filtros actuales.")
+        return
+
+    confidence_colors = {
+        "Alta": "#10b981",
+        "Media": "#f59e0b",
+        "Baja": "#ef4444",
+    }
+    ev_rows = [row for row in rows if row.get("EV%") is not None]
+    confidence_counts = {
+        level: sum(row.get("Nivel de Confianza") == level for row in rows)
+        for level in ("Alta", "Media", "Baja")
+    }
+    top_five = sorted(ev_rows, key=lambda row: row["EV%"], reverse=True)[:5]
+    overround_rows = sorted(rows, key=lambda row: row["Overround calculado (%)"])
+
+    scatter_x = []
+    scatter_y = []
+    scatter_text = []
+    scatter_customdata = []
+    for row in ev_rows:
+        overround_value = float(row["Overround medio (%)"])
+        jitter = random.uniform(-0.30, 0.30)
+        scatter_x.append(overround_value + jitter)
+        scatter_y.append(float(row["EV%"]))
+        scatter_text.append(row["Partido"] if abs(float(row["EV%"])) > 10 else "")
+        scatter_customdata.append([
+            row["Nivel de Confianza"],
+            row["Selección con mayor EV"],
+            row["Casa con mejor cuota"],
+            float(row["Overround medio (%)"]),
+            row["Partido"],
+        ])
+
+    figure = make_subplots(
+        rows=2,
+        cols=2,
+        subplot_titles=(
+            "EV estimado vs. overround medio por casa",
+            "Distribución de confianza",
+            "Top 5 EV estimado",
+            "Overround calculado por partido",
+        ),
+        horizontal_spacing=0.12,
+        vertical_spacing=0.2,
+        row_heights=[0.45, 0.55],
+    )
+    figure.add_trace(
+        go.Scatter(
+            x=scatter_x,
+            y=scatter_y,
+            mode="markers+text",
+            marker={
+                "size": 12,
+                "color": [
+                    confidence_colors.get(row["Nivel de Confianza"], "#94a3b8")
+                    for row in ev_rows
+                ],
+                "line": {"width": 2, "color": "white"},
+            },
+            text=scatter_text,
+            textposition="top center",
+            textfont={"size": 9, "color": "#f8fafc"},
+            customdata=scatter_customdata,
+            hovertemplate=(
+                "<b>%{customdata[1]}</b><br>" 
+                "Partido: %{customdata[4]}<br>"
+                "Overround medio por casa: %{customdata[3]:.2f}%<br>"
+                "EV estimado: %{y:.2f}%<br>"
+                "Confianza: %{customdata[0]}<br>"
+                "Casa: %{customdata[2]}<extra></extra>"
+            ),
+            showlegend=False,
+        ),
+        row=1,
+        col=1,
+    )
+    figure.add_hline(y=0, line_dash="dot", line_color="rgba(148,163,184,0.7)", row=1, col=1)
+    figure.add_hline(y=5, line_dash="dash", line_color="rgba(250,204,21,0.9)", row=1, col=1)
+    figure.add_trace(
+        go.Bar(
+            x=list(confidence_counts),
+            y=list(confidence_counts.values()),
+            marker_color=[confidence_colors[level] for level in confidence_counts],
+            text=list(confidence_counts.values()),
+            textposition="auto",
+            showlegend=False,
+        ),
+        row=1,
+        col=2,
+    )
+    figure.add_trace(
+        go.Bar(
+            x=[row["EV%"] for row in reversed(top_five)],
+            y=[row["Partido"] for row in reversed(top_five)],
+            orientation="h",
+            marker_color=[
+                confidence_colors.get(row["Nivel de Confianza"], "#94a3b8")
+                for row in reversed(top_five)
+            ],
+            customdata=[
+                [row["Selección con mayor EV"], row["Casa con mejor cuota"]]
+                for row in reversed(top_five)
+            ],
+            hovertemplate=(
+                "%{y}<br>EV: %{x:.2f}%"
+                "<br>Selección: %{customdata[0]}"
+                "<br>Casa: %{customdata[1]}<extra></extra>"
+            ),
+            showlegend=False,
+        ),
+        row=2,
+        col=1,
+    )
+    figure.add_trace(
+        go.Bar(
+            x=[row["Overround calculado (%)"] for row in overround_rows],
+            y=[row["Partido"] for row in overround_rows],
+            orientation="h",
+            marker_color="#818cf8",
+            hovertemplate="%{y}<br>Overround combinado: %{x:.2f}%<extra></extra>",
+            showlegend=False,
+        ),
+        row=2,
+        col=2,
+    )
+    figure.update_xaxes(title_text="Overround medio por casa (%)", row=1, col=1)
+    figure.update_yaxes(title_text="EV estimado (%)", row=1, col=1)
+    figure.update_yaxes(title_text="Partidos", row=1, col=2)
+    figure.update_xaxes(title_text="EV estimado (%)", row=2, col=1)
+    figure.update_xaxes(title_text="Overround combinado (%)", row=2, col=2)
+    figure.update_yaxes(
+        tickfont={"size": 10},
+        automargin=True,
+        row=2,
+        col=1,
+    )
+    figure.update_yaxes(
+        tickfont={"size": 10},
+        automargin=True,
+        row=2,
+        col=2,
+    )
+    dark = theme == "Oscuro"
+    figure.update_layout(
+        template="plotly_dark" if dark else "plotly_white",
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(30,30,40,0.8)" if dark else "rgba(255,255,255,0.75)",
+        font={"color": "white" if dark else "#172033", "size": 12},
+        height=920,
+        hovermode="closest",
+        margin={"t": 85, "b": 30, "l": 45, "r": 25},
+        showlegend=False,
+    )
+    st.plotly_chart(figure, use_container_width=True)
+
+
+def render_match_cards(rows, qwen_analyst=None, qwen_enabled=False):
+    for row in rows:
+        status = row["Estado EV"]
+        ev = row["Mejor EV estimado (%)"]
+        ev_label = f"{ev:+.2f}%" if ev is not None else "N/D"
+        recommended_selection = row["Selección recomendada"]
+        qualifies_threshold = recommended_selection != "Ninguna"
+        ev_badge, ev_class = get_ev_badge(ev, qualifies_threshold)
+        selected_outcome = (
+            recommended_selection
+            if qualifies_threshold
+            else row["Selección con mayor EV"]
+        )
+        odds_column = {
+            "Local": "Mejor local",
+            "Empate": "Mejor empate",
+            "Visitante": "Mejor visitante",
+        }.get(selected_outcome)
+        selected_odds = row[odds_column] if odds_column else None
+        selected_details = {
+            "Local": (
+                "EV local (%)",
+                "Prob. estimada local (%)",
+                "Confianza local",
+                "Stake Kelly local ($)",
+            ),
+            "Empate": (
+                "EV empate (%)",
+                "Prob. estimada empate (%)",
+                "Confianza empate",
+                "Stake Kelly empate ($)",
+            ),
+            "Visitante": (
+                "EV visitante (%)",
+                "Prob. estimada visitante (%)",
+                "Confianza visitante",
+                "Stake Kelly visitante ($)",
+            ),
+        }.get(selected_outcome)
+        selected_ev = row[selected_details[0]] if selected_details else None
+        selected_probability = row[selected_details[1]] if selected_details else None
+        selected_confidence = row[selected_details[2]] if selected_details else "Baja"
+        selected_stake = row[selected_details[3]] if selected_details else 0.0
+        selection_label = (
+            "Selección que supera umbral/confianza"
+            if qualifies_threshold
+            else "Selección con mayor EV (no supera el filtro)"
+        )
+        title = (
+            f"{row['Partido']}  ·  {status}  ·  EV: {ev_badge}  ·  "
+            f"Confianza: {row['Confianza mejor EV']}"
+        )
+        with st.expander(title):
+            football_status = row.get("API-Football estado", "not_configured")
+            football_label = {
+                "ok": "✅ API-Football · forma y goles",
+                "partial": "⚠️ API-Football · datos parciales",
+                "no_match": "⚠️ API-Football · equipos sin coincidencia",
+                "unavailable": "❌ API-Football · no disponible",
+                "unsupported_competition": "⚠️ API-Football · liga no configurada",
+                "not_configured": "➖ API-Football · clave no configurada",
+                "paused": "⏸ API-Football · consultas pausadas",
+            }.get(football_status, "❌ API-Football · estado desconocido")
+            st.caption(
+                (
+                    "APIs: ✅ The Odds API · "
+                    if row.get("Consultas API activas", True)
+                    else "APIs: ⏸ The Odds API · datos en caché · "
+                )
+                + f"{football_label} · ➖ xG/lesiones no disponibles · "
+                "🌦️ clima pendiente de sede"
+            )
+            render_match_fusion(
+                row,
+                qwen_analyst=qwen_analyst,
+                qwen_enabled=qwen_enabled,
+            )
+            st.markdown(
+                f'<span class="ev-badge {ev_class}">{html.escape(ev_badge)}</span> '
+                f'<span class="confidence-badge '
+                f'{get_confidence_badge(row["Confianza mejor EV"])}">'
+                f'Confianza {html.escape(row["Confianza mejor EV"])}</span><br>'
+                f"**{html.escape(status)}** — Selección con mayor EV: "
+                f"**{html.escape(str(row['Selección con mayor EV']))}** en "
+                f"**{html.escape(str(row['Casa con mejor cuota']))}**. "
+                f"{selection_label}: "
+                f"**{html.escape(str(recommended_selection))}**.",
+                unsafe_allow_html=True,
+            )
+            st.markdown(
+                f"""
+                <div class="one-click-card">
+                    <div style="font-size:0.76rem;font-weight:800;letter-spacing:0.06em;color:#94a3b8">
+                        ACCIÓN SUGERIDA
+                    </div>
+                    <div style="font-size:1.12rem;font-weight:800;margin:0.35rem 0 0.65rem">
+                        {html.escape(str(selected_outcome))}
+                        {" @ " + format(selected_odds, ".2f") if selected_odds is not None else ""}
+                        {" · " + html.escape(str(row["Casa con mejor cuota"]))}
+                    </div>
+                    <div style="color:#cbd5e1;font-size:0.88rem">
+                        {html.escape(selection_label)} · EV {f"{selected_ev:+.2f}%" if selected_ev is not None else "N/D"}
+                        · Prob. {f"{selected_probability:.1f}%" if selected_probability is not None else "N/D"}
+                        · Confianza {html.escape(str(selected_confidence))}
+                        · Kelly ${float(selected_stake or 0.0):.2f}
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+            if st.button(
+                "➕ Preparar en mi tracker",
+                key=f"prepare_bet_{row['event_id']}",
+                disabled=not qualifies_threshold or selected_odds is None,
+                help=(
+                    "Prellena el tracker para que revises y confirmes los datos."
+                    if qualifies_threshold
+                    else "Esta selección no cumple los filtros de EV y confianza."
+                ),
+                type="primary" if qualifies_threshold else "secondary",
+            ):
+                st.session_state["personal_bet_prefill"] = {
+                    "Partido": row["Partido"],
+                    "Selección": selected_outcome,
+                    "Cuota": float(selected_odds),
+                    "Stake ($)": max(0.01, float(selected_stake or 0.0)),
+                    "EV estimado (%)": float(selected_ev or 0.0),
+                    "Prob. estimada (%)": float(selected_probability or 0.0),
+                }
+                st.rerun()
+            st.caption(
+                f"Inicio UTC: {row['Inicio (UTC)']} · "
+                f"{row['Casas']} casas · "
+                f"Overround calculado con las mejores cuotas: "
+                f"{row['Overround calculado (%)']:.2f}% · "
+                f"Overround de calibración: "
+                f"{row['Overround calibración (%)']:.2f}% · "
+                f"Overround medio: {row['Overround medio (%)']:.2f}%"
+            )
+
+            outcome_columns = st.columns(3)
+            outcome_details = (
+                (
+                    "Local",
+                    "Mejor local",
+                    "Prob. estimada local (%)",
+                    "EV local (%)",
+                    "Confianza local",
+                    "Consenso local (%)",
+                ),
+                (
+                    "Empate",
+                    "Mejor empate",
+                    "Prob. estimada empate (%)",
+                    "EV empate (%)",
+                    "Confianza empate",
+                    "Consenso empate (%)",
+                ),
+                (
+                    "Visitante",
+                    "Mejor visitante",
+                    "Prob. estimada visitante (%)",
+                    "EV visitante (%)",
+                    "Confianza visitante",
+                    "Consenso visitante (%)",
+                ),
+            )
+            for column, details in zip(outcome_columns, outcome_details):
+                label, odds_key, probability_key, ev_key, confidence_key, consensus_key = details
+                with column:
+                    probability = row[probability_key]
+                    outcome_ev = row[ev_key]
+                    st.metric(label, f"{row[odds_key]:.2f}")
+                    st.caption(
+                        f"Prob. est.: {probability:.2f}%"
+                        if probability is not None
+                        else "Prob. est.: N/D"
+                    )
+                    st.caption(
+                        f"EV: {outcome_ev:+.2f}%"
+                        if outcome_ev is not None
+                        else "EV: N/D"
+                    )
+                    st.caption(
+                        f"Confianza: {row[confidence_key]} · "
+                        f"Consenso: {row[consensus_key]:.1f}%"
+                    )
+                    st.markdown(
+                        f'<span class="confidence-badge '
+                        f'{get_confidence_badge(row[confidence_key])}">'
+                        f'{html.escape(row[confidence_key])}</span>',
+                        unsafe_allow_html=True,
+                    )
+
+            stake_column, margin_column, alert_column = st.columns(3)
+            stake_column.metric(
+                "Stake Kelly fraccional ($)",
+                f"${row['Stake Kelly ($)']:.2f}",
+            )
+            margin_column.metric(
+                "EV estimado",
+                ev_label,
+            )
+            alert_column.metric("Alerta EV", row["Alerta EV"])
+            st.caption(row["Alertas"])
+
+
+def render_alert_grid(rows):
+    columns = list(rows[0])
+    header = "".join(f"<th>{html.escape(column)}</th>" for column in columns)
+    column_widths = {
+        "Partido": 145,
+        "Inicio (UTC)": 130,
+        "Casas": 52,
+        "Overround medio (%)": 105,
+        "Overround calibración (%)": 120,
+        "Cuota mediana local": 90,
+        "Cuota mediana empate": 95,
+        "Cuota mediana visitante": 105,
+        "Mejor local": 72,
+        "Mejor empate": 75,
+        "Mejor visitante": 82,
+        "Mayor diferencia vs mediana (%)": 120,
+        "Prob. estimada local (%)": 100,
+        "Prob. estimada empate (%)": 100,
+        "Prob. estimada visitante (%)": 105,
+        "Confianza local": 78,
+        "Consenso local (%)": 90,
+        "Confianza empate": 78,
+        "Consenso empate (%)": 90,
+        "Confianza visitante": 85,
+        "Consenso visitante (%)": 95,
+        "EV local (%)": 72,
+        "EV empate (%)": 75,
+        "EV visitante (%)": 82,
+        "Mejor EV estimado (%)": 100,
+        "Confianza mejor EV": 105,
+        "Estado EV": 145,
+        "Selección con mayor EV": 100,
+        "Casa con mejor cuota": 125,
+        "Stake Kelly fraccional": 105,
+        "Alerta EV": 65,
+        "Alertas": 190,
+    }
+    colgroup = "".join(
+        f'<col style="width:{column_widths.get(column, 100)}px">'
+        for column in columns
+    )
+    body = "".join(
+        f'<tr class="{("ev-positive" if row["Estado EV"] == "🔥 EV+ con confianza" else "confidence-low" if row["Estado EV"] == "⚠️ Confianza baja" else "ev-low")}">'
+        + "".join(
+            f"<td>{html.escape('N/D' if row[column] is None else str(row[column]))}</td>"
+            for column in columns
+        )
+        + "</tr>"
+        for row in rows
+    )
+    return f"""
+    <style>
+    .alert-grid-scroll {{
+        height: 300px;
+        max-width: 100%;
+        overflow: auto;
+        border: 1px solid rgba(128, 128, 128, 0.35);
+        border-radius: 6px;
+        scrollbar-width: auto;
+        scrollbar-color: rgba(128, 128, 128, 0.9) rgba(128, 128, 128, 0.15);
+    }}
+    .alert-grid-scroll::-webkit-scrollbar {{
+        width: 12px;
+        height: 12px;
+    }}
+    .alert-grid-scroll::-webkit-scrollbar-thumb {{
+        background: rgba(128, 128, 128, 0.9);
+        border: 3px solid transparent;
+        border-radius: 8px;
+        background-clip: padding-box;
+    }}
+    .alert-grid-scroll table {{
+        width: max-content;
+        min-width: 100%;
+        table-layout: fixed;
+        border-collapse: separate;
+        border-spacing: 0;
+        font-family: inherit;
+        font-size: 11px;
+        line-height: 1.2;
+    }}
+    .alert-grid-scroll th,
+    .alert-grid-scroll td {{
+        padding: 4px 6px;
+        border-right: 1px solid rgba(128, 128, 128, 0.2);
+        border-bottom: 1px solid rgba(128, 128, 128, 0.2);
+        text-align: left;
+        vertical-align: top;
+        overflow-wrap: anywhere;
+    }}
+    .alert-grid-scroll th {{
+        position: sticky;
+        top: 0;
+        z-index: 1;
+        background: var(--secondary-background-color);
+        font-weight: 600;
+    }}
+    .alert-grid-scroll tr.ev-high td {{
+        background: rgba(46, 160, 67, 0.28);
+    }}
+    .alert-grid-scroll tr.ev-positive td {{
+        background: rgba(46, 160, 67, 0.16);
+    }}
+    .alert-grid-scroll tr.ev-watch td {{
+        background: rgba(210, 153, 34, 0.20);
+    }}
+    .alert-grid-scroll tr.ev-low td {{
+        background: rgba(248, 81, 73, 0.12);
+    }}
+    .alert-grid-scroll tr.confidence-low td {{
+        background: rgba(210, 153, 34, 0.16);
+    }}
+    </style>
+    <div class="alert-grid-scroll">
+      <table>
+        <colgroup>{colgroup}</colgroup>
+        <thead><tr>{header}</tr></thead>
+        <tbody>{body}</tbody>
+      </table>
+    </div>
+    """
+
+
+def render_sidebar_theme():
+    theme = st.selectbox(
+        "🎨 Tema",
+        options=("Oscuro", "Claro"),
+        key="app_theme",
+    )
+    if theme == "Claro":
+        st.markdown(
+            """
+            <style>
+            :root { color-scheme: light; }
+            body, .stApp {
+                background-color: #f3f5f9 !important;
+                color: #172033 !important;
+            }
+            div[data-testid="stAppViewContainer"] {
+                background: linear-gradient(145deg, #f8fafc, #e8eef8) !important;
+                color: #172033 !important;
+            }
+            section[data-testid="stSidebar"] > div {
+                background: linear-gradient(180deg, #e9eef7, #f8fafc) !important;
+                border-right: 1px solid rgba(71, 85, 105, 0.2);
+            }
+            div[data-testid="stExpander"] {
+                background: rgba(255, 255, 255, 0.86) !important;
+            }
+            .stMarkdown, [data-testid="stMetricLabel"] {
+                color: #172033;
+            }
+            .metric-card {
+                color: #172033;
+                background: linear-gradient(135deg, #ffffff, #e9eff8) !important;
+            }
+            .terminal-kpi {
+                color: #172033;
+                background: linear-gradient(135deg, #ffffff, #e9eff8) !important;
+                border-color: rgba(71, 85, 105, 0.2) !important;
+            }
+            .terminal-kpi-label { color: #52627a !important; }
+            .terminal-kpi-value { color: #172033 !important; }
+            .terminal-kpi-foot { color: #64748b !important; }
+            .one-click-card {
+                background: linear-gradient(120deg, #eff6ff, #f8fafc) !important;
+                border-color: rgba(71, 85, 105, 0.2) !important;
+            }
+            .confidence-high, .ev-positive { color: #087443 !important; }
+            .confidence-medium, .ev-moderate { color: #8a5a00 !important; }
+            .confidence-low, .ev-negative { color: #b42318 !important; }
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
+    return theme
+
+
+with st.sidebar:
+    st.header("Scanner")
+    api_queries_enabled = st.toggle(
+        "🌐 Consultas a APIs activas",
+        value=False,
+        key="api_queries_enabled",
+        help=(
+            "Apágalo para detener las consultas automáticas y manuales a "
+            "The Odds API, API-Football y Qwen. Se conservarán los últimos "
+            "datos cargados."
+        ),
+    )
+    if api_queries_enabled:
+        st.caption("🟢 APIs activas")
+    else:
+        st.caption("⚪ APIs pausadas")
+    st.markdown("""
+    <style>
+    div[data-baseweb="popover"] ul {
+        max-height: 20rem;
+        overflow-y: auto;
+    }
+    div[data-baseweb="popover"] ul > div {
+        scrollbar-color: rgba(128, 128, 128, 0.9) transparent;
+        scrollbar-width: thin;
+    }
+    div[data-baseweb="popover"] ul > div::-webkit-scrollbar {
+        width: 8px;
+    }
+    div[data-baseweb="popover"] ul > div::-webkit-scrollbar-thumb {
+        background: rgba(128, 128, 128, 0.9);
+        border-radius: 4px;
+    }
+    div[data-baseweb="popover"] ul > div::-webkit-scrollbar-track {
+        background: transparent;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+    competition_catalog = COMPETICIONES_DISPONIBLES
+    if api_queries_enabled:
+        catalog_api_key = get_api_key()
+        if catalog_api_key:
+            try:
+                available_competitions = fetch_soccer_competitions(catalog_api_key)
+                available_keys = set(available_competitions.values())
+                unavailable = [
+                    name
+                    for name, key in COMPETICIONES_DISPONIBLES.items()
+                    if key not in available_keys
+                ]
+                competition_catalog = {
+                    name: key
+                    for name, key in COMPETICIONES_DISPONIBLES.items()
+                    if key in available_keys
+                }
+                if unavailable:
+                    st.warning(
+                        "Estas competencias curadas no están disponibles ahora en "
+                        "The Odds API y se ocultaron: "
+                        + ", ".join(unavailable)
+                    )
+                if competition_catalog:
+                    st.session_state["curated_competitions_cache"] = (
+                        competition_catalog
+                    )
+                else:
+                    competition_catalog = st.session_state.get(
+                        "curated_competitions_cache",
+                        COMPETICIONES_DISPONIBLES,
+                    )
+                    st.warning(
+                        "The Odds API no devolvió ninguna de las 16 competencias "
+                        "curadas; se conserva la lista local."
+                    )
+            except (requests.RequestException, ValueError) as exc:
+                st.warning(
+                    "No se pudo actualizar el catálogo de fútbol de The Odds API; "
+                    f"se usará la lista curada local. Detalle: {redact_secrets(exc)}"
+                )
+                competition_catalog = st.session_state.get(
+                    "curated_competitions_cache",
+                    COMPETICIONES_DISPONIBLES,
+                )
+        else:
+            st.warning(
+                "No se encontró la clave de The Odds API; se muestra la lista "
+                "curada local."
+            )
+    elif st.session_state.get("curated_competitions_cache"):
+        competition_catalog = st.session_state["curated_competitions_cache"]
+
+    competition_labels = list(competition_catalog)
+    if st.session_state.get("competition_selector") not in competition_labels:
+        st.session_state["competition_selector"] = competition_labels[0]
+    competicion_nombre = st.selectbox(
+        "Competencias curadas · seleccionar",
+        options=competition_labels,
+        key="competition_selector",
+        help=(
+            "16 ligas y copas organizadas por el nivel estratégico sugerido. "
+            "La etiqueta no representa una garantía de EV ni de rentabilidad."
+        ),
+    )
+    sport_key = competition_catalog[competicion_nombre]
+    st.caption(f"🏷️ {competicion_nombre}")
+    refresh = st.button(
+        "🔄 Actualizar cuotas",
+        type="primary",
+        use_container_width=True,
+        disabled=not api_queries_enabled,
+    )
+    if refresh:
+        st.session_state["manual_refresh_request"] = (
+            st.session_state.get("manual_refresh_request", 0) + 1
+        )
+    st.caption(
+        "Actualización automática cada 5 minutos, solo con las APIs activas "
+        "(cada actualización consume créditos)."
+    )
+    loaded_events = (
+        st.session_state.get("events", [])
+        if st.session_state.get("events_sport") == sport_key
+        else []
+    )
+    loaded_rows = flatten_events(loaded_events)
+    event_book_counts = {}
+    for quote_row in loaded_rows:
+        event_book_counts.setdefault(quote_row["event_id"], set()).add(
+            quote_row["Casa"]
+        )
+    available_book_limit = max(
+        (len(houses) for houses in event_book_counts.values()),
+        default=10,
+    )
+    available_book_limit = max(1, available_book_limit)
+    valid_margins = [
+        quote_row["Overround (%)"]
+        for quote_row in loaded_rows
+        if 0 <= quote_row["Overround (%)"] <= MAX_EVENT_OVERROUND_PERCENT
+    ]
+    margin_limit = (
+        min(
+            MAX_EVENT_OVERROUND_PERCENT,
+            max(0.5, math.ceil(max(valid_margins) * 2) / 2),
+        )
+        if valid_margins
+        else MAX_EVENT_OVERROUND_PERCENT
+    )
+    if st.session_state.get("filters_for_sport") != sport_key:
+        recommended_filters = obtener_filtros_recomendados(competicion_nombre)
+        st.session_state["min_books_filter"] = recommended_filters["casas_min"]
+        st.session_state["max_margin_filter"] = recommended_filters["overround_max"]
+        st.session_state["filters_for_sport"] = sport_key
+    st.session_state["min_books_filter"] = min(
+        max(1, int(st.session_state.get("min_books_filter", 8))),
+        available_book_limit,
+    )
+    st.session_state["max_margin_filter"] = min(
+        max(0.0, float(st.session_state.get("max_margin_filter", 6.0))),
+        margin_limit,
+    )
+
+    with st.expander("⚙️ Filtros", expanded=False):
+        theme = render_sidebar_theme()
+        threshold = st.slider(
+            "Alerta si mejor cuota supera la mediana (%)", 1.0, 20.0, 3.0, 0.5
+        )
+        max_margin = st.slider(
+            "Límite de overround (%)",
+            min_value=0.0,
+            max_value=float(margin_limit),
+            step=0.5,
+            key="max_margin_filter",
+            help=(
+                f"Tope actual: {margin_limit:.1f}%, basado en mercados válidos "
+                "disponibles y el máximo de seguridad del 15%."
+            ),
+        )
+        min_books = st.slider(
+            "Mínimo de casas por partido",
+            min_value=1,
+            max_value=available_book_limit,
+            step=1,
+            key="min_books_filter",
+            help=(
+                "El rango se adapta al mayor número de casas con cuotas válidas "
+                "en los datos cargados para esta competencia."
+            ),
+        )
+        team_search = st.text_input("Filtrar por equipo")
+        filter_by_ev = st.checkbox(
+            "Filtrar solo partidos que superen el umbral de EV", value=True
+        )
+
+    with st.expander("💰 Bankroll y riesgo", expanded=False):
+        bankroll = st.number_input(
+            "Bankroll ($)",
+            min_value=0.0,
+            max_value=999.0,
+            value=19.26,
+            step=0.01,
+            format="%.2f",
+        )
+        kelly_fraction_percent = st.slider(
+            "Kelly fraccional (%)", 5, 50, 25, 5
+        )
+        risk_profile = st.radio(
+            "Perfil de riesgo",
+            options=list(RISK_PROFILES),
+            horizontal=True,
+            help=(
+                "Ajusta automáticamente EV mínimo, probabilidad estimada, "
+                "stake Kelly y confianza mínimos para los filtros y recomendaciones."
+            ),
+        )
+        active_profile = RISK_PROFILES[risk_profile]
+        ev_threshold = active_profile["ev_threshold"]
+        minimum_probability = active_profile["minimum_probability"]
+        minimum_kelly_stake = active_profile["minimum_kelly_stake"]
+        minimum_confidence = active_profile["minimum_confidence"]
+        st.caption(
+            f"Perfil activo: {risk_profile} · EV ≥ {ev_threshold:.1f}% · "
+            f"Prob. ≥ {minimum_probability:.0f}% · "
+            f"Kelly ≥ ${minimum_kelly_stake:.2f} · "
+            f"Confianza {minimum_confidence}+"
+        )
+        st.markdown("---")
+        small_bankroll_mode = st.checkbox(
+            "🛡️ Modo Bankroll Pequeño (<$25)",
+            value=True,
+            key="small_bankroll_mode",
+            help=(
+                "Stake máx $1.00, solo Simples o Dobles, cuotas 1.65-2.10 y "
+                "mínimo 5 casas."
+            ),
+        )
+        if small_bankroll_mode:
+            st.success("✅ Modo protección activado")
+            st.caption(
+                "• Stake máximo: $1.00\n"
+                "• Solo apuestas simples o dobles\n"
+                "• Cuotas objetivo: 1.65 - 2.10\n"
+                "• Mínimo 5 casas de apuestas"
+            )
+            min_books = max(min_books, small_bankroll.MIN_BOOKS)
+        else:
+            st.warning(
+                "⚠️ Sin protección: los stakes siguen solo el criterio de Kelly "
+                "y el perfil de riesgo. Con un bankroll pequeño aumenta el "
+                "riesgo de ruina."
+            )
+    sidebar_summaries = summarize_events(
+        loaded_rows,
+        threshold,
+        bankroll=bankroll,
+        kelly_fraction=kelly_fraction_percent / 100,
+        ev_threshold=ev_threshold,
+        minimum_confidence=minimum_confidence,
+    )
+    sidebar_quality_event_ids = {
+        row["event_id"]
+        for row in sidebar_summaries
+        if passes_quality_filter(row, min_books, max_margin)
+    }
+    with st.expander("📅 Calendario y fechas", expanded=False):
+        st.markdown("**📍 Zona horaria: Panamá (UTC-5)**")
+        date_mode = st.radio(
+            "Rango de fechas",
+            options=list(date_range.MODES),
+            index=1,
+            key="date_mode",
+            horizontal=True,
+            help="Filtra los partidos analizados por fecha de inicio.",
+        )
+        panama_today = date_range.today_panama()
+        custom_range = None
+        if date_mode == "Rango personalizado":
+            col_from, col_to = st.columns(2)
+            limit_min = panama_today - timedelta(days=30)
+            limit_max = panama_today + timedelta(days=30)
+            date_from = col_from.date_input(
+                "Desde", value=panama_today, min_value=limit_min,
+                max_value=limit_max, format="DD/MM/YYYY", key="date_from",
+            )
+            date_to = col_to.date_input(
+                "Hasta", value=panama_today + timedelta(days=7),
+                min_value=limit_min, max_value=limit_max,
+                format="DD/MM/YYYY", key="date_to",
+            )
+            if date_from > date_to:
+                st.error("⚠️ La fecha de inicio no puede ser mayor que la final.")
+                date_from, date_to = date_to, date_from
+            custom_range = (date_from, date_to)
+        range_start, range_end = date_range.resolve_range(
+            date_mode, custom_range, panama_today
+        )
+        st.session_state["date_range_filter"] = (range_start, range_end)
+        st.caption(
+            f"Mostrando partidos del {range_start:%d/%m/%Y} al {range_end:%d/%m/%Y}."
+        )
+
+    with st.expander("🗓️ Calendario semanal", expanded=False):
+        render_sidebar_weekly_calendar(loaded_rows, sidebar_quality_event_ids)
+
+    with st.expander("🔌 APIs y análisis", expanded=False):
+        qwen_api_key = get_qwen_api_key(st.secrets)
+        qwen_model = get_qwen_model(st.secrets)
+        qwen_enabled = st.checkbox(
+            "🤖 Permitir análisis manual con Qwen",
+            value=False,
+            disabled=not api_queries_enabled or not qwen_api_key,
+            help=(
+                "Qwen solo se consulta al pulsar un botón; no analiza partidos "
+                "automáticamente."
+            ),
+        )
+        if not qwen_api_key:
+            st.caption("Qwen sin configurar; análisis narrativo deshabilitado.")
+        elif not api_queries_enabled:
+            st.caption("Qwen no hará solicitudes mientras las APIs estén pausadas.")
+        else:
+            st.caption(f"Qwen listo · Modelo: {qwen_model}")
+        configured_api_football_key = obtener_api_key(
+            "API_FOOTBALL_KEY", st.secrets
+        )
+        st.caption(
+            "API-Football configurada."
+            if configured_api_football_key
+            else "API-Football sin configurar."
+        )
+        render_api_configuration_panel(
+            st.secrets,
+            api_queries_enabled,
+            use_expander=False,
+        )
+
+
+missing_required_apis = verificar_apis_requeridas(st.secrets)
+if missing_required_apis:
+    st.error(
+        "⚠️ Falta configurar una API requerida: "
+        + ", ".join(missing_required_apis)
+        + ". Abre «🔑 Configuración de APIs» en el sidebar. "
+        "Las claves opcionales no detienen el scanner."
+    )
+    st.stop()
+api_key = get_api_key()
+api_football_key = obtener_api_key("API_FOOTBALL_KEY", st.secrets)
+
+
+@st.fragment(run_every="5m")
+def explain_quality_exclusions(summaries, min_books, max_margin):
+    maximum_margin = min(max_margin, MAX_EVENT_OVERROUND_PERCENT)
+    reasons = {"few_books": [], "high_margin": []}
+    for row in summaries:
+        if passes_quality_filter(row, min_books, max_margin):
+            continue
+        if row["Casas"] < min_books:
+            reasons["few_books"].append(row["Partido"])
+        else:
+            reasons["high_margin"].append(row["Partido"])
+    lines = []
+    if reasons["few_books"]:
+        lines.append(
+            f"{len(reasons['few_books'])} con menos de {min_books} casas "
+            "(baja el filtro «Mínimo de casas»)"
+        )
+    if reasons["high_margin"]:
+        lines.append(
+            f"{len(reasons['high_margin'])} con overround superior a "
+            f"{maximum_margin:.1f}% (sube el «Límite de overround»)"
+        )
+    return lines
+
+
+def render_quota_status():
+    headers = {
+        str(key).lower(): value
+        for key, value in st.session_state.get("quota_headers", {}).items()
+    }
+    remaining = headers.get("x-requests-remaining")
+    used = headers.get("x-requests-used")
+    if remaining is None:
+        return
+    text = f"Créditos The Odds API: {remaining} restantes"
+    if used is not None:
+        text += f" · {used} usados"
+    try:
+        low = float(remaining) <= 50
+    except ValueError:
+        low = False
+    if low:
+        st.warning("⚠️ " + text + ". Quedan pocos créditos.")
+    else:
+        st.caption("🎟️ " + text)
+
+
+def render_steam_moves_panel():
+    moves = st.session_state.get("steam_moves") or []
+    if not moves:
+        return
+    with st.expander(f"🔥 Movimientos bruscos de cuota ({len(moves)})"):
+        st.caption(
+            f"Cambios de {STEAM_THRESHOLD:.0%} o más entre las dos últimas "
+            "actualizaciones. Son señales descriptivas, no recomendaciones."
+        )
+        st.dataframe(
+            pd.DataFrame(moves).drop(columns=["event_id", "timestamp"]),
+            width="stretch",
+            hide_index=True,
+        )
+
+
+def fetch_totals(sport_key, api_key):
+    events, headers = api_get(f"/sports/{sport_key}/odds/", {
+        "apiKey": api_key,
+        "regions": REGION,
+        "markets": "totals",
+        "oddsFormat": "decimal",
+        "dateFormat": "iso",
+    })
+    st.session_state["totals_events"] = events
+    st.session_state["totals_sport"] = sport_key
+    st.session_state["quota_headers"] = dict(headers)
+
+
+AUTOPILOT_MAX_MATCHES = 3
+
+
+def run_autopilot(recommendations, matches, load_h2h, load_weather):
+    """Load H2H and weather only for the best lines; failures never abort."""
+    by_event = {m["event_id"]: m for m in matches}
+    cache = st.session_state.setdefault("autopilot", {})
+    for rec in recommendations[:AUTOPILOT_MAX_MATCHES]:
+        event_id = rec["event_id"]
+        match = by_event.get(event_id)
+        if match is None or event_id in cache:
+            continue
+        entry = {"h2h": None, "weather": None, "errors": []}
+        for name, loader in (("h2h", load_h2h), ("weather", load_weather)):
+            if loader is None:
+                continue
+            try:
+                entry[name] = loader(match)
+            except (RuntimeError, ValueError, requests.RequestException) as exc:
+                entry["errors"].append(f"{name}: {exc}")
+        cache[event_id] = entry
+
+
+VERDICT_ICONS = {"APOSTAR": "🟢", "CONSIDERAR": "🟡", "OBSERVAR": "🟠", "DESCARTAR": "🔴"}
+
+
+def render_extra_verdicts(sport_key, recommendations, bankroll, risk_profile):
+    """Verdicts for loaded Over/Under lines and the best parlays."""
+    items = []
+    if st.session_state.get("totals_sport") == sport_key:
+        for row in summarize_totals(st.session_state.get("totals_events", [])):
+            verdict = analyze_totals(row)
+            if verdict["decision"] != "DESCARTAR":
+                items.append((f"{row['Partido']} · O/U {row['Línea']}", verdict))
+    combos = generate_combinations(recommendations, bankroll, risk_profile)
+    if st.session_state.get("small_bankroll_mode"):
+        combos = small_bankroll.cap_combinations(combos)
+    for combo in combos[:3]:
+        verdict = analyze_combination(combo)
+        label = " + ".join(leg["Partido"] for leg in combo["Selecciones"])
+        items.append((f"{combo['Tipo']} #{combo['Ranking']} · {label}", verdict))
+    if not items:
+        return
+    items.sort(key=lambda item: -VERDICT_RANK[item[1]["decision"]])
+    st.markdown("**Over/Under y combinadas**")
+    for label, verdict in items:
+        with st.expander(f"{VERDICT_ICONS[verdict['decision']]} {verdict['decision']} · {label}"):
+            for text in verdict["reasons"]:
+                st.write("✅ " + text)
+            for text in verdict["warnings"]:
+                st.write("⚠️ " + text)
+
+
+def render_valor_detectado(recommendations, bankroll, max_picks=5):
+    """Tarjetas resumen de las mejores líneas con EV positivo ya filtradas."""
+    st.markdown("### 🎯 Valor detectado")
+    if not recommendations:
+        st.info(
+            "No hay líneas con EV positivo que superen los filtros. "
+            "Lo más sano es no apostar."
+        )
+        return
+    st.caption(
+        "Probabilidad = consenso de las casas sin margen. Apuesta solo si tu "
+        "casa paga igual o más que la cuota mostrada."
+    )
+    picks = sorted(recommendations, key=lambda r: r["EV%"], reverse=True)[:max_picks]
+    for i, pick in enumerate(picks, 1):
+        ev = pick["EV%"]
+        color = "#00b894" if ev >= 7 else "#fdcb6e" if ev >= 4 else "#74b9ff"
+        cuota = pick["Cuota"]
+        prob = pick["Prob. estimada (%)"]
+        implicita = 100 / cuota if cuota > 1 else 0
+        stake = pick["Stake ($)"]
+        st.markdown(
+            f"""
+<div class="action-card" style="border-left: 5px solid {color};">
+  <span class="action-badge" style="background:{color}22;color:{color};">PICK #{i} · {html.escape(str(pick['Confianza']))}</span>
+  <h4 style="margin:6px 0;">{html.escape(str(pick['Partido']))}</h4>
+  <div><strong>{html.escape(str(pick['Selección']))} @ {cuota:.2f}</strong> · {html.escape(str(pick['Casa']))}</div>
+  <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-top:12px;">
+    <div><small>Prob. estimada</small><br><b>{prob:.1f}%</b></div>
+    <div><small>Prob. implícita</small><br><b>{implicita:.1f}%</b></div>
+    <div><small>EV</small><br><b style="color:{color};">{ev:+.2f}%</b></div>
+    <div><small>Stake · retorno</small><br><b>${stake:.2f} · ${stake * cuota:.2f}</b></div>
+  </div>
+</div>""",
+            unsafe_allow_html=True,
+        )
+
+    pair = None
+    for a_index, a in enumerate(picks):
+        for b in picks[a_index + 1:]:
+            if a.get("event_id") != b.get("event_id"):
+                pair = (a, b)
+                break
+        if pair:
+            break
+    if pair:
+        a, b = pair
+        odds = a["Cuota"] * b["Cuota"]
+        prob = a["Prob. estimada (%)"] / 100 * b["Prob. estimada (%)"] / 100
+        combo_ev = (prob * odds - 1) * 100
+        st.markdown("#### 🔗 Doble sugerida")
+        st.markdown(
+            f"- {a['Partido']} → **{a['Selección']}** @ {a['Cuota']:.2f}\n"
+            f"- {b['Partido']} → **{b['Selección']}** @ {b['Cuota']:.2f}\n\n"
+            f"Cuota {odds:.2f} · Prob. {prob * 100:.1f}% · EV {combo_ev:+.2f}% "
+            f"· Stake sugerido ${min(a['Stake ($)'], b['Stake ($)']):.2f}"
+        )
+        st.caption(
+            "Asume eventos independientes y acumula el margen de las casas; "
+            "más varianza que una simple."
+        )
+
+
+def render_autopilot_panel(
+    recommendations, matches, load_h2h, load_weather, api_queries_enabled,
+    narrate=None, sport_key="", bankroll=0.0, risk_profile="",
+    gemini_analyst=None, gemini_enabled=False,
+):
+    st.subheader("🤖 Analista automático")
+    st.caption(
+        "Cruza cuotas, forma/H2H y clima con reglas fijas y explica cada veredicto. "
+        "No cambia el EV ni predice resultados."
+    )
+    enabled = st.toggle(
+        f"Piloto automático: cargar H2H y clima de las {AUTOPILOT_MAX_MATCHES} mejores líneas "
+        "(consume solicitudes de API-Football)",
+        key="autopilot_enabled",
+        disabled=not api_queries_enabled,
+    )
+    if enabled and api_queries_enabled:
+        with st.spinner("Analizando con las 3 APIs..."):
+            run_autopilot(recommendations, matches, load_h2h, load_weather)
+    cache = st.session_state.get("autopilot", {})
+    by_event = {m["event_id"]: m for m in matches}
+    verdicts = []
+    for rec in recommendations:
+        match = by_event.get(rec["event_id"])
+        if match is None:
+            continue
+        data = cache.get(rec["event_id"], {})
+        verdict = analyze_match(match, rec, data.get("h2h"), data.get("weather"))
+        verdicts.append((rec, verdict, data.get("errors", [])))
+    if not verdicts:
+        st.info("Sin líneas 1X2 aptas: el analista no recomienda apostar hoy.")
+        render_extra_verdicts(sport_key, recommendations, bankroll, risk_profile)
+        return
+    verdicts.sort(key=lambda item: (-VERDICT_RANK[item[1]["decision"]], -item[0]["EV%"]))
+    for rec, verdict, errors in verdicts:
+        icon = VERDICT_ICONS[verdict["decision"]]
+        with st.expander(
+            f"{icon} {verdict['decision']} · {rec['Partido']} · {rec['Selección']} "
+            f"@ {float(rec['Cuota']):.2f}",
+            expanded=verdict["decision"] == "APOSTAR",
+        ):
+            st.caption("Fuentes: " + ", ".join(verdict["sources"]))
+            for text in verdict["reasons"]:
+                st.write("✅ " + text)
+            for text in verdict["warnings"]:
+                st.write("⚠️ " + text)
+            for text in errors:
+                st.caption("No disponible: " + text)
+    render_extra_verdicts(sport_key, recommendations, bankroll, risk_profile)    # Panel de análisis con Gemini
+    if gemini_enabled and gemini_analyst is not None:
+        st.markdown("---")
+        st.subheader("🧠 Análisis profundo con Gemini")
+        st.caption(
+            "Gemini 1.5 Flash analiza forma, H2H, clima y cuotas con razonamiento analítico profundo."
+        )
+        
+        if st.button(
+            "🔍 Analizar top 3 recomendaciones con Gemini",
+            key="gemini_analyze_top3",
+            disabled=len(recommendations) == 0,
+        ):
+            top3 = recommendations[:3]
+            matches_data = []
+            for rec in top3:
+                match = next((m for m in matches if m["event_id"] == rec["event_id"]), None)
+                if match:
+                    match_data = {
+                        **rec,
+                        "Estadísticas local": match.get("Estadísticas local", {}),
+                        "Estadísticas visitante": match.get("Estadísticas visitante", {}),
+                        "H2H": match.get("H2H", []),
+                        "Clima": match.get("Clima", {}),
+                    }
+                    matches_data.append(match_data)
+            
+            with st.spinner("Analizando con Gemini 1.5 Flash..."):
+                results = gemini_analyst.analizar_multiples_partidos(matches_data)
+            
+            for result in results:
+                verdict_icon = {
+                    "APOSTAR": "🟢", "CONSIDERAR": "🟡", "OBSERVAR": "🟠", "DESCARTAR": "🔴", "ERROR": "❌"
+                }.get(result["verdict"], "⚪")
+                
+                with st.expander(
+                    f"{verdict_icon} {result['verdict']} · {result['partido']} · {result['seleccion']} @ {result['cuota']:.2f}",
+                    expanded=result["verdict"] == "APOSTAR",
+                ):
+                    st.markdown(f"**Confianza:** {result['confidence']}")
+                    st.markdown(f"**Stake recomendado:** {result['stake_recommendation']}")
+                    if result["reasons"]:
+                        st.markdown("**Razones principales:**")
+                        for reason in result["reasons"]: st.write(f"✅ {reason}")
+                    if result["risks"]:
+                        st.markdown("**Riesgos identificados:**")
+                        for risk in result["risks"]: st.write(f"⚠️ {risk}")
+                    if result["analysis"]:
+                        st.markdown("**Análisis contextual:**")
+                        st.write(result["analysis"])
+    if narrate is not None and st.button(
+        "🗣️ Explicar veredictos con Qwen", key="narrate_verdicts"
+    ):
+        payload = [
+            {
+                "partido": rec["Partido"],
+                "seleccion": rec["Selección"],
+                "cuota": float(rec["Cuota"]),
+                "ev_pct": round(float(rec["EV%"]), 2),
+                "decision": verdict["decision"],
+                "motivos": verdict["reasons"],
+                "avisos": verdict["warnings"],
+            }
+            for rec, verdict, _ in verdicts
+        ]
+        try:
+            with st.spinner("Redactando explicación..."):
+                st.markdown(narrate(payload))
+        except (requests.RequestException, RuntimeError, ValueError) as exc:
+            st.error(f"No se pudo generar la explicación: {exc}")
+
+
+def render_sharp_vs_square_panel(sport_key):
+    if st.session_state.get("events_sport") != sport_key:
+        return
+    rows = calculate_sharp_vs_square_odds(st.session_state.get("events", []))
+    st.subheader("🎯 Casas sharp vs square")
+    st.caption(
+        "Compara la mejor cuota de casas recreativas con la cuota justa de las "
+        "sharp (Pinnacle y exchanges) sin margen. Es una diferencia de precio, "
+        "no una predicción; las sharp también se equivocan y Pinnacle puede "
+        "llegar con retraso. Usa los créditos ya consumidos del refresco."
+    )
+    if not rows:
+        st.info("No hay diferencias de precio relevantes entre casas sharp y square.")
+        return
+    st.dataframe(
+        pd.DataFrame(rows).drop(columns=["event_id"]),
+        width="stretch",
+        hide_index=True,
+    )
+
+
+def render_totals_panel(sport_key, api_queries_enabled, matches=()):
+    st.subheader("⚽ Over/Under 2.5 goles")
+    st.caption(
+        "Probabilidad = consenso de las casas sin margen; el EV compara la mejor "
+        "cuota con ese consenso, no con la probabilidad real."
+    )
+    api_key = get_api_key()
+    if st.button(
+        "📥 Cargar Over/Under 2.5 (consume 1 crédito de The Odds API)",
+        key="load_totals",
+        disabled=not api_queries_enabled or not api_key,
+    ):
+        try:
+            fetch_totals(sport_key, api_key)
+        except requests.RequestException as exc:
+            st.error(f"No se pudo cargar Over/Under: {redact_secrets(exc)}")
+    if not api_queries_enabled:
+        st.caption("Activa las consultas a APIs para cargar este mercado.")
+    if st.session_state.get("totals_sport") != sport_key:
+        return
+    rows = summarize_totals(st.session_state.get("totals_events", []))
+    if not rows:
+        st.info("The Odds API no devolvió Over/Under 2.5 con casas suficientes.")
+        return
+    rows.sort(key=lambda row: max(row["EV Over (%)"] or -99, row["EV Under (%)"] or -99), reverse=True)
+    visible = [{k: v for k, v in row.items() if k != "event_id"} for row in rows]
+    st.dataframe(pd.DataFrame(visible), width="stretch", hide_index=True)
+
+    inconsistencies = scan_inconsistencies(matches, rows)
+    if inconsistencies:
+        st.markdown("**🔎 Posibles inconsistencias entre 1X2 y Over/Under**")
+        st.caption(
+            "Compara el Over 2.5 del mercado con el que implica el 1X2 (modelo de "
+            "Poisson). Es una diferencia entre mercados, no una predicción; el "
+            "modelo subestima empates y no ve lesiones ni alineaciones."
+        )
+        st.dataframe(
+            pd.DataFrame(inconsistencies).drop(columns=["event_id"]),
+            width="stretch",
+            hide_index=True,
+        )
+
+
+def render_api_info_panel(api_queries_enabled, football_api_key, weather_api_key, enrichment):
+    with st.expander("📡 Información técnica de APIs", expanded=False):
+        _render_api_info_body(
+            api_queries_enabled, football_api_key, weather_api_key, enrichment
+        )
+
+
+def _render_api_info_body(
+    api_queries_enabled, football_api_key, weather_api_key, enrichment
+):
+    headers = {
+        str(k).lower(): v for k, v in st.session_state.get("quota_headers", {}).items()
+    }
+    odds_remaining = headers.get("x-requests-remaining", "sin consultar")
+    odds_used = headers.get("x-requests-used", "sin consultar")
+    football_limit = getattr(enrichment, "last_rate_limit", {}) or {}
+    football_remaining = football_limit.get("remaining", "N/D")
+    football_total = football_limit.get("limit", "N/D")
+    try:
+        football_remaining = int(football_remaining)
+        football_total = int(football_total)
+    except (TypeError, ValueError):
+        pass
+    last_refresh = st.session_state.get("last_refresh")
+    refreshed = (
+        datetime.fromtimestamp(last_refresh, tz=timezone.utc)
+        .astimezone()
+        .strftime("%H:%M:%S")
+        if last_refresh
+        else "nunca"
+    )
+    events = st.session_state.get("events", [])
+    cached = st.session_state.get("football_enrichment_cache", {}).get("events", {})
+    info = pd.DataFrame([
+        {
+            "API": "The Odds API",
+            "Estado": "🟢 configurada" if get_api_key() else "🔴 sin clave",
+            "Aporta": "Cuotas 1X2 y Over/Under por casa",
+            "Créditos": f"{odds_remaining} restantes · {odds_used} usados",
+            "Datos cargados": f"{len(events)} partidos · última carga {refreshed}",
+        },
+        {
+            "API": "API-Football",
+            "Estado": "🟢 configurada" if football_api_key else "🔴 sin clave",
+            "Aporta": "Forma, goles, posiciones, H2H y ciudad del estadio",
+            "Créditos": (
+                f"{football_remaining} restantes de {football_total} diarios"
+                if football_limit
+                else "sin consultar"
+            ),
+            "Datos cargados": f"{len(cached)} partidos enriquecidos",
+        },
+        {
+            "API": "OpenWeatherMap",
+            "Estado": "🟢 configurada" if weather_api_key else "🔴 sin clave",
+            "Aporta": "Pronóstico a la hora del partido (bajo demanda)",
+            "Créditos": "el proveedor no informa cuota por consulta",
+            "Datos cargados": "se consulta por partido, con botón",
+        },
+    ])
+    st.dataframe(info, width="stretch", hide_index=True)
+
+    if (
+        isinstance(football_remaining, int)
+        and isinstance(football_total, int)
+        and football_total > 0
+    ):
+        usage_percent = (football_total - football_remaining) / football_total * 100
+        if usage_percent >= 90:
+            st.error(
+                f"🚨 **CRÍTICO**: Solo quedan {football_remaining} requests de "
+                "API-Football hoy. Desactiva el Piloto Automático inmediatamente."
+            )
+            st.warning("💡 Recomendación: cambia a modo manual hasta mañana.")
+        elif usage_percent >= 75:
+            st.warning(
+                f"⚠️ **ALTO CONSUMO**: {football_remaining} requests restantes "
+                f"({usage_percent:.0f}% usado). Considera reducir el Piloto Automático."
+            )
+        elif usage_percent >= 50:
+            st.info(
+                f"ℹ️ **CONSUMO MODERADO**: {football_remaining} requests restantes "
+                f"({usage_percent:.0f}% usado)."
+            )
+
+    st.caption(
+        "Consultas externas: "
+        + ("activas" if api_queries_enabled else "pausadas")
+        + ". No hay xG, lesiones, ratings ni dinero del público en estas APIs."
+    )
+
+
+def render_combinations_panel(recommendations, bankroll, risk_profile, competition=""):
+    st.subheader("🎰 Combinadas de líneas aptas")
+    st.caption(
+        "Orientativo: las combinadas multiplican el margen de las casas y el "
+        "error de cada estimación, y asumen partidos independientes. "
+        "Nunca se combinan dos selecciones del mismo partido."
+    )
+    combos = generate_combinations(recommendations, bankroll, risk_profile)
+    if st.session_state.get("small_bankroll_mode"):
+        combos = small_bankroll.cap_combinations(combos)
+    if not combos:
+        st.info(
+            "Se necesitan al menos 2 líneas aptas de partidos distintos con "
+            "EV combinado positivo."
+        )
+        return
+    types = sorted({combo["Tipo"] for combo in combos})
+    columns = st.columns(3)
+    selected_types = columns[0].multiselect(
+        "Tipo", types, default=types, key="combo_types"
+    )
+    risks = ["Bajo", "Medio", "Alto", "Muy alto"]
+    selected_risks = columns[1].multiselect(
+        "Riesgo", risks, default=risks, key="combo_risks"
+    )
+    top_n = columns[2].number_input(
+        "Mostrar top", min_value=1, max_value=50, value=10, key="combo_top"
+    )
+    filtered = [
+        combo for combo in combos
+        if combo["Tipo"] in selected_types and combo["Riesgo"] in selected_risks
+    ][: int(top_n)]
+    metrics = st.columns(3)
+    metrics[0].metric("Combinadas válidas", len(combos))
+    metrics[1].metric("Mejor EV", f"{max(c['EV estimado (%)'] for c in combos):+.1f}%")
+    metrics[2].metric(
+        "Perfil",
+        f"{profile_key(risk_profile)} · máx {PROFILE_LIMITS[profile_key(risk_profile)]['max_legs']} patas",
+    )
+    for combo in filtered:
+        title = (
+            f"#{combo['Ranking']} {combo['Tipo']} · cuota {combo['Cuota combinada']:.2f} · "
+            f"EV {combo['EV estimado (%)']:+.1f}% · riesgo {combo['Riesgo']}"
+        )
+        with st.expander(title):
+            for leg in combo["Selecciones"]:
+                st.write(
+                    f"• {leg['Partido']} — {leg['Selección']} @ {leg['Cuota']:.2f} "
+                    f"({leg['Casa']})"
+                )
+            st.caption(
+                f"Probabilidad estimada {combo['Prob. estimada (%)']:.1f}% · "
+                f"stake sugerido ${combo['Stake sugerido ($)']:.2f} · "
+                f"retorno potencial ${combo['Retorno potencial ($)']:.2f}. "
+                "Es una estimación, no una garantía."
+            )
+            if st.button(
+                "📝 Registrar esta combinada",
+                key=f"register_combo_{combo['Ranking']}_{combo['Cuota combinada']}",
+            ):
+                try:
+                    save_combination_bet(combo, competition)
+                    st.success("Combinada registrada en tu tracker.")
+                except (OSError, csv.Error, ValueError) as exc:
+                    st.error(f"No se pudo registrar: {exc}")
+
+
+def _aplicar_filtros(casas=None, overround=None):
+    if casas is not None:
+        st.session_state["min_books_filter"] = int(casas)
+    if overround is not None:
+        st.session_state["max_margin_filter"] = float(overround)
+
+
+def render_panel_diagnostico(
+    total_partidos,
+    partidos_filtrados_casas,
+    partidos_filtrados_overround,
+    partidos_aptos,
+    filtros_actuales,
+    filtros_recomendados,
+):
+    if not total_partidos:
+        return
+    st.markdown("### 🔍 Diagnóstico del scanner")
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Partidos totales", total_partidos)
+    col2.metric("Partidos aptos", partidos_aptos)
+    col3.metric(
+        "Filtros actuales",
+        f"{filtros_actuales['casas_min']} casas / "
+        f"{filtros_actuales['overround_max']:.1f}%",
+    )
+    if not (partidos_filtrados_casas or partidos_filtrados_overround):
+        st.success("✅ Todos los partidos cumplen los filtros de calidad.")
+        return
+    st.warning(
+        f"**{total_partidos - partidos_aptos} de {total_partidos} partidos "
+        "quedaron fuera por filtros de calidad:**\n\n"
+        f"- {partidos_filtrados_casas} con menos de "
+        f"{filtros_actuales['casas_min']} casas\n"
+        f"- {partidos_filtrados_overround} con overround superior a "
+        f"{filtros_actuales['overround_max']:.1f}%"
+    )
+    rec_casas = filtros_recomendados["casas_min"]
+    rec_margen = filtros_recomendados["overround_max"]
+    st.markdown("**🔧 Ajustes rápidos (recomendados para esta liga):**")
+    b1, b2, b3 = st.columns(3)
+    b1.button(
+        f"⬇️ Casas mínimas: {rec_casas}",
+        key="diag_btn_casas",
+        use_container_width=True,
+        disabled=filtros_actuales["casas_min"] == rec_casas,
+        on_click=_aplicar_filtros,
+        kwargs={"casas": rec_casas},
+    )
+    b2.button(
+        f"⬆️ Overround máx.: {rec_margen}%",
+        key="diag_btn_margen",
+        use_container_width=True,
+        disabled=filtros_actuales["overround_max"] == rec_margen,
+        on_click=_aplicar_filtros,
+        kwargs={"overround": rec_margen},
+    )
+    b3.button(
+        "✨ Aplicar recomendados",
+        key="diag_btn_ambos",
+        type="primary",
+        use_container_width=True,
+        on_click=_aplicar_filtros,
+        kwargs={"casas": rec_casas, "overround": rec_margen},
+    )
+    st.caption(
+        "El tope del slider de overround depende de los datos cargados, "
+        "así que el valor puede quedar limitado a ese máximo."
+    )
+
+
+def render_partidos_casi_aptos(partidos_filtrados, filtros_actuales, max_items=5):
+    if not partidos_filtrados:
+        return
+    st.markdown("---")
+    st.markdown("### ⚠️ Partidos casi aptos (ajusta filtros para verlos)")
+    st.caption(
+        "Estos partidos no cumplen todos los filtros actuales; "
+        "revisa qué les falta antes de decidir."
+    )
+    maximo = min(filtros_actuales["overround_max"], MAX_EVENT_OVERROUND_PERCENT)
+    for partido in partidos_filtrados[:max_items]:
+        razones = []
+        if partido["Casas"] < filtros_actuales["casas_min"]:
+            razones.append(
+                f"🏠 Solo {partido['Casas']} casas "
+                f"(mínimo: {filtros_actuales['casas_min']})"
+            )
+        margen = max(
+            partido["Overround medio (%)"],
+            partido["Overround calibración (%)"],
+        )
+        if margen > maximo:
+            razones.append(f"📊 Overround {margen:.1f}% (máximo: {maximo:.1f}%)")
+        if not razones:
+            continue
+        cerca = len(razones) == 1
+        color = "#fdcb6e" if cerca else "#e17055"
+        icono = "⚡" if cerca else "⚠️"
+        inicio = html.escape(str(partido.get("Inicio (UTC)") or "")[:16])
+        st.markdown(
+            f"""
+<div style="border-left:4px solid {color};padding:12px;margin:8px 0;
+background:rgba(253,203,110,0.05);border-radius:6px;">
+<div style="display:flex;justify-content:space-between;align-items:center;">
+<strong>{icono} {html.escape(str(partido['Partido']))}</strong>
+<span style="color:#94a3b8;font-size:0.85em;">{inicio}</span></div>
+<div style="margin-top:8px;font-size:0.9em;color:#cbd5e1;">
+{html.escape(' · '.join(razones))}</div></div>""",
+            unsafe_allow_html=True,
+        )
+
+
+def render_results(api_key, sport_key, threshold, max_margin, min_books,
+                   team_search, manual_refresh_request, bankroll,
+                   kelly_fraction_percent, ev_threshold, minimum_probability,
+                   minimum_kelly_stake, minimum_confidence,
+                   football_api_key, api_queries_enabled, qwen_api_key,
+                   qwen_model, qwen_enabled):
+    now = datetime.now(timezone.utc).timestamp()
+    previous_sport = st.session_state.get("events_sport")
+    last_refresh = st.session_state.get("last_refresh", 0)
+    should_refresh = api_queries_enabled and (
+        sport_key != previous_sport
+        or now - last_refresh >= REFRESH_INTERVAL_SECONDS
+        or manual_refresh_request
+        > st.session_state.get("manual_refresh_completed", 0)
+    )
+
+    if not api_queries_enabled:
+        st.warning(
+            "Consultas a APIs pausadas. Se muestran los últimos datos cargados; "
+            "no se harán solicitudes hasta volver a activarlas."
+        )
+
+    if should_refresh:
+        try:
+            with st.spinner("Actualizando cuotas..."):
+                events, headers = api_get(f"/sports/{sport_key}/odds/", {
+                    "apiKey": api_key,
+                    "regions": REGION,
+                    "markets": MARKET,
+                    "oddsFormat": "decimal",
+                    "dateFormat": "iso",
+                })
+            if sport_key == previous_sport:
+                st.session_state["steam_moves"] = detect_steam_moves(
+                    events,
+                    st.session_state.get("events", []),
+                    STEAM_THRESHOLD,
+                )
+            else:
+                st.session_state["steam_moves"] = []
+            st.session_state["events"] = events
+            st.session_state["events_sport"] = sport_key
+            st.session_state["quota_headers"] = dict(headers)
+            st.session_state["last_refresh"] = datetime.now(timezone.utc).timestamp()
+            try:
+                saved_rows = append_history_snapshot(
+                    sport_key,
+                    events,
+                    threshold,
+                    bankroll,
+                    kelly_fraction_percent / 100,
+                    ev_threshold,
+                    minimum_confidence,
+                )
+                if saved_rows:
+                    st.session_state["history_save_error"] = None
+                    st.session_state["history_rows_saved"] = saved_rows
+                else:
+                    st.session_state["history_save_error"] = (
+                        "No se guardó el histórico: la API no devolvió cuotas "
+                        "1X2 completas."
+                    )
+            except OSError as exc:
+                st.session_state["history_save_error"] = (
+                    f"No se pudo guardar el histórico en {HISTORY_PATH}: {exc}"
+                )
+        except requests.HTTPError as exc:
+            if exc.response is None:
+                st.error(f"No se pudo actualizar: {redact_secrets(exc)}")
+            else:
+                st.error(
+                    f"Error de API ({exc.response.status_code}): "
+                    f"{redact_secrets(exc.response.text[:400])}"
+                )
+        except requests.RequestException as exc:
+            st.error(f"No se pudo actualizar: {redact_secrets(exc)}")
+        finally:
+            st.session_state["manual_refresh_completed"] = manual_refresh_request
+
+    if st.session_state.get("events_sport") != sport_key:
+        st.info("Esperando a que se carguen las cuotas de esta competencia.")
+        return
+
+    last_refresh = st.session_state.get("last_refresh")
+    if last_refresh:
+        refreshed_at = datetime.fromtimestamp(
+            last_refresh, tz=timezone.utc
+        ).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+        st.caption(f"Última actualización: {refreshed_at}")
+    render_quota_status()
+    render_steam_moves_panel()
+    history_error = st.session_state.get("history_save_error")
+    if history_error:
+        st.error(history_error)
+
+    validation_warnings = []
+    rows_all = flatten_events(
+        st.session_state.get("events", []), validation_warnings
+    )
+    if not rows_all:
+        st.subheader("📅 Oportunidades de hoy")
+        st.info(
+            "Aún no hay cuotas 1X2 completas para mostrar oportunidades. "
+            "Comprueba la competencia seleccionada o vuelve a intentarlo más tarde."
+        )
+        return
+
+    rows = rows_all
+    if validation_warnings:
+        st.caption(
+            f"Se omitieron {len(validation_warnings)} registros de cuotas "
+            "no válidas; se muestran solo precios dentro del rango admitido."
+        )
+    summaries = summarize_events(
+        rows,
+        threshold,
+        bankroll=bankroll,
+        kelly_fraction=kelly_fraction_percent / 100,
+        ev_threshold=ev_threshold,
+        minimum_confidence=minimum_confidence,
+    )
+    quality_results = [
+        row for row in summaries
+        if passes_quality_filter(row, min_books, max_margin)
+    ]
+    range_start, range_end = st.session_state.get(
+        "date_range_filter", (None, None)
+    )
+    outside_range = 0
+    if range_start is not None:
+        in_range = date_range.filter_by_date(
+            quality_results, range_start, range_end
+        )
+        outside_range = len(quality_results) - len(in_range)
+        quality_results = in_range
+        if outside_range:
+            st.caption(
+                f"📅 {outside_range} partidos quedan fuera del rango de fechas "
+                f"({range_start:%d/%m} al {range_end:%d/%m/%Y}, hora de Panamá). "
+                "Cámbialo en «Calendario y fechas»."
+            )
+    small_mode_discarded = 0
+    if st.session_state.get("small_bankroll_mode"):
+        quality_results, small_mode_discarded = small_bankroll.filter_matches(
+            quality_results
+        )
+        if small_mode_discarded:
+            st.info(
+                f"🛡️ **Modo Protección:** se ocultaron {small_mode_discarded} "
+                "partidos que no cumplen las reglas de seguridad (cuota de la "
+                "selección fuera de 1.65-2.10 o menos de 5 casas)."
+            )
+    render_panel_diagnostico(
+        len(summaries),
+        sum(1 for row in summaries if row["Casas"] < min_books),
+        sum(
+            1
+            for row in summaries
+            if row["Casas"] >= min_books
+            and not passes_quality_filter(row, min_books, max_margin)
+        ),
+        len(quality_results),
+        {"casas_min": min_books, "overround_max": max_margin},
+        obtener_filtros_recomendados(competicion_nombre),
+    )
+    render_partidos_casi_aptos(
+        [row for row in summaries if row not in quality_results],
+        {"casas_min": min_books, "overround_max": max_margin},
+    )
+    if summaries and not quality_results:
+        st.info(
+            "💡 Ningún partido cumple los filtros actuales. Usa los botones "
+            "de ajuste rápido del diagnóstico para ver oportunidades."
+        )
+    football_data = {}
+    enrichment = get_data_enrichment(football_api_key)
+    cached_football = st.session_state.get("football_enrichment_cache", {})
+    if api_queries_enabled and football_api_key and quality_results:
+        try:
+            with st.spinner("Cargando forma y goles de API-Football..."):
+                football_data = asyncio.run(
+                    enrichment.enrich_matches(
+                        quality_results,
+                        sport_key,
+                        datetime.now(timezone.utc).year,
+                    )
+                )
+        except RuntimeError as exc:
+            st.caption(
+                "API-Football no está disponible ahora; las tarjetas muestran "
+                f"solo cuotas. Detalle: {redact_secrets(exc)}"
+            )
+        else:
+            st.session_state["football_enrichment_cache"] = {
+                "sport_key": sport_key,
+                "events": football_data,
+            }
+    elif (
+        cached_football.get("sport_key") == sport_key
+        and isinstance(cached_football.get("events"), dict)
+    ):
+        football_data = cached_football["events"]
+    for summary in quality_results:
+        data = football_data.get(summary["event_id"], {})
+        summary["API-Football estado"] = data.get(
+            "status",
+            "not_configured" if not football_api_key else "paused",
+        )
+        summary["Estadísticas local"] = data.get("home")
+        summary["Estadísticas visitante"] = data.get("away")
+        summary["Clima estado"] = "location_unavailable"
+
+    def load_head_to_head(match):
+        if not api_queries_enabled or not football_api_key:
+            raise RuntimeError(
+                "Activa API-Football y configura su clave para cargar H2H."
+            )
+        home_stats = match.get("Estadísticas local")
+        away_stats = match.get("Estadísticas visitante")
+        if not isinstance(home_stats, dict) or not isinstance(away_stats, dict):
+            raise ValueError(
+                "API-Football no devolvió IDs para ambos equipos."
+            )
+        return asyncio.run(
+            enrichment.fetch_head_to_head(
+                home_stats.get("ID"),
+                away_stats.get("ID"),
+            )
+        )
+
+    try:
+        weather_api_key = obtener_api_key(
+            "OPENWEATHERMAP_API_KEY", st.secrets
+        )
+    except (OSError, ValueError, KeyError):
+        weather_api_key = None
+
+    def load_match_weather(match):
+        if not api_queries_enabled or not football_api_key or not weather_api_key:
+            raise RuntimeError(
+                "Activa las consultas y configura API-Football y OpenWeatherMap."
+            )
+        home_stats = match.get("Estadísticas local")
+        if not isinstance(home_stats, dict) or not home_stats.get("ID"):
+            raise ValueError(
+                "No hay ID de equipo para resolver la sede del partido."
+            )
+        city = asyncio.run(enrichment.fetch_team_city(home_stats["ID"]))
+        return fetch_match_weather(
+            city,
+            match.get("Inicio (UTC)"),
+            weather_api_key,
+        )
+
+    results = quality_results
+    if filter_by_ev:
+        results = [
+            row for row in results
+            if row["Mejor EV estimado (%)"] is not None
+            and CONFIDENCE_RANK[row["Confianza mejor EV"]]
+            >= CONFIDENCE_RANK[minimum_confidence]
+            and row["Mejor EV estimado (%)"] >= ev_threshold
+            and row["Probabilidad estimada (%)"] is not None
+            and row["Probabilidad estimada (%)"] >= minimum_probability
+            and row["Stake Kelly ($)"] >= minimum_kelly_stake
+        ]
+    if team_search.strip():
+        query = team_search.strip().casefold()
+        results = [x for x in results if query in x["Partido"].casefold()]
+
+    recommendation_rows = quality_results
+    if team_search.strip():
+        query = team_search.strip().casefold()
+        recommendation_rows = [
+            row
+            for row in recommendation_rows
+            if query in row["Partido"].casefold()
+        ]
+    recommendations, _, _ = generate_automatic_recommendations(
+        recommendation_rows,
+        bankroll,
+        ev_threshold,
+        minimum_probability=minimum_probability,
+        minimum_kelly_stake=minimum_kelly_stake,
+        daily_stake_limit=0.20,
+        minimum_confidence=minimum_confidence,
+    )
+    if st.session_state.get("small_bankroll_mode"):
+        recommendations = small_bankroll.filter_recommendations(recommendations)
+    theme = st.session_state.get("app_theme", "Oscuro")
+    try:
+        history_rows = (
+            pd.read_csv(HISTORY_PATH).fillna("").to_dict(orient="records")
+            if HISTORY_PATH.exists()
+            else []
+        )
+    except (OSError, pd.errors.ParserError, ValueError) as exc:
+        st.error(f"No se pudo cargar el histórico para las tarjetas: {exc}")
+        history_rows = []
+    render_today_opportunities(
+        quality_results,
+        recommendations,
+        sport_key,
+        rows,
+        history_rows,
+        h2h_loader=(
+            load_head_to_head
+            if api_queries_enabled and football_api_key
+            else None
+        ),
+        weather_loader=(
+            load_match_weather
+            if api_queries_enabled and football_api_key and weather_api_key
+            else None
+        ),
+    )
+    render_valor_detectado(recommendations, bankroll)
+    # Inicializar analista de Gemini si está habilitado
+gemini_analyst_instance = None
+if gemini_enabled and gemini_api_key:
+    try:
+        gemini_analyst_instance = get_gemini_analyst(gemini_api_key, gemini_model)
+    except Exception as e:
+        st.error(f"Error al inicializar Gemini: {e}")
+
+render_autopilot_panel(
+    recommendations,
+    quality_results,
+    load_head_to_head if api_queries_enabled and football_api_key else None,
+    load_match_weather if api_queries_enabled and football_api_key and weather_api_key else None,
+    api_queries_enabled,
+    narrate=(
+        get_qwen_analyst(qwen_api_key, qwen_model or DEFAULT_QWEN_MODEL).explicar_veredictos
+        if qwen_enabled and api_queries_enabled and qwen_api_key else None
+    ),
+    sport_key=sport_key,
+    bankroll=bankroll,
+    risk_profile=risk_profile,
+    gemini_analyst=gemini_analyst_instance,
+    gemini_enabled=gemini_enabled,
+)
+
+    has_odds_history = HISTORY_PATH.exists()
+    has_bet_history = BET_TRACKER_PATH.exists()
+    if has_odds_history or has_bet_history:
+        with st.expander("🗂️ Historial", expanded=False):
+            render_bet_history()
+            if has_odds_history:
+                try:
+                    st.download_button(
+                        "Descargar histórico de cuotas",
+                        HISTORY_PATH.read_bytes(),
+                        HISTORY_PATH.name,
+                        "text/csv",
+                    )
+                except OSError as exc:
+                    st.error(f"No se pudo leer el histórico CSV: {exc}")
+                render_historical_simulation(
+                    sport_key, ev_threshold, minimum_confidence
+                )
+
+
+render_results(
+    api_key,
+    sport_key,
+    threshold,
+    max_margin,
+    min_books,
+    team_search,
+    st.session_state.get("manual_refresh_request", 0),
+    bankroll,
+    kelly_fraction_percent,
+    ev_threshold,
+    minimum_probability,
+    minimum_kelly_stake,
+    minimum_confidence,
+    api_football_key,
+    api_queries_enabled,
+    qwen_api_key,
+    qwen_model,
+    qwen_enabled,
+)
+
+
+@st.fragment(run_every=REFRESH_INTERVAL_SECONDS)
+def auto_refresh_tick():
+    now = datetime.now(timezone.utc).timestamp()
+    last_tick = st.session_state.get("auto_refresh_last_tick", now)
+    st.session_state["auto_refresh_last_tick"] = last_tick
+    if (
+        api_queries_enabled
+        and now - last_tick >= REFRESH_INTERVAL_SECONDS - 5
+    ):
+        st.session_state["auto_refresh_last_tick"] = now
+        st.rerun()
+
+
+auto_refresh_tick()

@@ -1,0 +1,6 @@
+{
+  "name": "Scanner de Apuestas - Market Efficiency & Real-Time Odds",
+  "description": "Herramienta profesional de escaneo y análisis de cuotas deportivas en tiempo real, arbitraje (surebets), valor esperado (EV+), movimientos bruscos (steam moves) y gestión de bankroll con IA.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
