@@ -16,6 +16,7 @@ import { MatchEvent, Competition, SurebetOpportunity, SteamMove, PersonalBet } f
 import { COMPETITIONS, generateInitialMatches, applyLiveTick } from './utils/mockOddsGenerator';
 import { detectSurebets } from './utils/mathEngine';
 import { notificationService, NotificationConfig, SurebetAlertLog } from './utils/notificationService';
+import { isPanamaToday, isPanamaNext7Days, isWithinPanamaRange } from './utils/dateUtils';
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<ActiveTab>('ev_bets');
@@ -345,27 +346,14 @@ export default function App() {
       if (!matchText.includes(q)) return false;
     }
 
-    // Date filtering: Hoy, Próximos 7 días, Selección de rango
+    // Date filtering: Hoy, Próximos 7 días, Selección de rango (Zona Horaria Panamá America/Panama UTC-5)
     if (filters.dateFilter !== 'all') {
-      const matchDate = new Date(m.commenceTime);
-      const now = new Date();
-      const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-      const todayEnd = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 23, 59, 59, 999);
-
       if (filters.dateFilter === 'today') {
-        if (matchDate < todayStart || matchDate > todayEnd) return false;
+        if (!isPanamaToday(m.commenceTime)) return false;
       } else if (filters.dateFilter === 'next_7_days') {
-        const next7DaysEnd = new Date(todayStart.getTime() + 7 * 24 * 3600 * 1000);
-        if (matchDate < todayStart || matchDate > next7DaysEnd) return false;
+        if (!isPanamaNext7Days(m.commenceTime)) return false;
       } else if (filters.dateFilter === 'custom_range') {
-        if (filters.customStartDate) {
-          const customStart = new Date(`${filters.customStartDate}T00:00:00`);
-          if (matchDate < customStart) return false;
-        }
-        if (filters.customEndDate) {
-          const customEnd = new Date(`${filters.customEndDate}T23:59:59`);
-          if (matchDate > customEnd) return false;
-        }
+        if (!isWithinPanamaRange(m.commenceTime, filters.customStartDate, filters.customEndDate)) return false;
       }
     }
 

@@ -2,6 +2,7 @@ import React, { useState, useMemo } from 'react';
 import { MatchEvent } from '../types/odds';
 import { Table, TrendingDown, Clock, Activity, ArrowRight, Shield, Layers } from 'lucide-react';
 import { calculateOverround } from '../utils/mathEngine';
+import { formatPanamaMatchSchedule } from '../utils/dateUtils';
 import {
   ResponsiveContainer,
   LineChart,
@@ -212,10 +213,13 @@ export const OddsMatrixView: React.FC<OddsMatrixViewProps> = ({ matches, selecte
 
       {/* Match Overview Ribbon */}
       <div className="bg-slate-900/90 border border-slate-800 rounded-xl p-4 flex flex-wrap items-center justify-between gap-4 text-xs">
-        <div>
+        <div className="flex items-center gap-2 flex-wrap">
           <span className="text-slate-500">Competición:</span>{' '}
-          <strong className="text-white">{currentMatch.competitionName}</strong> ·{' '}
-          <span className="text-slate-400">{new Date(currentMatch.commenceTime).toLocaleString('es-ES')}</span>
+          <strong className="text-white">{currentMatch.competitionName}</strong>
+          <span className="text-slate-600">·</span>
+          <span className="text-emerald-400 font-mono font-bold">
+            {formatPanamaMatchSchedule(currentMatch.commenceTime).display}
+          </span>
         </div>
 
         <div className="flex items-center gap-4">

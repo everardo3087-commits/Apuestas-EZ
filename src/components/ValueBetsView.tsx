@@ -1,6 +1,7 @@
 import React from 'react';
 import { MatchEvent } from '../types/odds';
-import { TrendingUp, Sparkles, PlusCircle, ArrowUpRight, CloudSun, Shield, AlertCircle, Box } from 'lucide-react';
+import { TrendingUp, Sparkles, PlusCircle, ArrowUpRight, CloudSun, Shield, AlertCircle, Box, Calendar } from 'lucide-react';
+import { formatPanamaMatchSchedule } from '../utils/dateUtils';
 
 interface ValueBetsViewProps {
   matches: MatchEvent[];
@@ -94,21 +95,30 @@ export const ValueBetsView: React.FC<ValueBetsViewProps> = ({
           }
           if (suggestedStake <= 0) suggestedStake = 1.00;
 
-          const kickoffDate = new Date(match.commenceTime);
-          const timeFormatted = kickoffDate.toLocaleTimeString('es-ES', { hour: '2-digit', minute: '2-digit' });
-          const dateFormatted = kickoffDate.toLocaleDateString('es-ES', { weekday: 'short', day: 'numeric', month: 'short' });
+          const schedule = formatPanamaMatchSchedule(match.commenceTime);
 
           return (
             <div
               key={match.id}
               className="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden hover:border-slate-700/80 transition-all shadow-sm"
             >
-              {/* Card Header */}
+              {/* Card Header with Panama Schedule */}
               <div className="p-4 bg-slate-950/40 border-b border-slate-800/80 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
-                <div className="flex items-center gap-2 text-xs">
+                <div className="flex items-center gap-2 text-xs flex-wrap">
                   <span className="font-semibold text-emerald-400">{match.competitionName}</span>
                   <span className="text-slate-600">·</span>
-                  <span className="text-slate-400 capitalize">{dateFormatted} a las {timeFormatted}</span>
+                  <span
+                    className={`px-1.5 py-0.5 rounded text-[10px] font-mono font-bold ${
+                      schedule.badge === 'HOY'
+                        ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'
+                        : schedule.badge === 'MAÑANA'
+                        ? 'bg-blue-500/20 text-blue-300 border border-blue-500/30'
+                        : 'bg-slate-800 text-slate-300 border border-slate-700'
+                    }`}
+                  >
+                    {schedule.badge}
+                  </span>
+                  <span className="text-slate-300">{schedule.display}</span>
                   {match.weather && (
                     <>
                       <span className="text-slate-600">·</span>

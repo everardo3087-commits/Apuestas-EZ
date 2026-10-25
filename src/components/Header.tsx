@@ -1,5 +1,6 @@
-import React from 'react';
-import { RefreshCw, Radio, Shield, DollarSign, Bell, Box } from 'lucide-react';
+import React, { useState, useEffect } from 'react';
+import { RefreshCw, Radio, Shield, DollarSign, Bell, Box, Clock } from 'lucide-react';
+import { getPanamaTimeString } from '../utils/dateUtils';
 
 export type ActiveTab = 'ev_bets' | 'surebets' | 'bookmakers_api' | 'steam_moves' | 'odds_matrix' | 'parlays' | 'tracker' | 'stadium_3d';
 
@@ -28,6 +29,14 @@ export const Header: React.FC<HeaderProps> = ({
   onOpenNotifications,
   notificationsActive,
 }) => {
+  const [panamaTime, setPanamaTime] = useState<string>(() => getPanamaTimeString(new Date()));
+
+  useEffect(() => {
+    const timer = setInterval(() => {
+      setPanamaTime(getPanamaTimeString(new Date()));
+    }, 10000);
+    return () => clearInterval(timer);
+  }, []);
   return (
     <header className="sticky top-0 z-40 bg-slate-950/90 backdrop-blur-md border-b border-slate-800">
       <div className="max-w-7xl mx-auto px-4 sm:px-6 h-16 flex items-center justify-between gap-8">
@@ -133,8 +142,16 @@ export const Header: React.FC<HeaderProps> = ({
           </button>
         </nav>
 
-        {/* Zone 3: 1 Primary Action (Update Odds) + Bankroll Pill + Notifications */}
+        {/* Zone 3: 1 Primary Action (Update Odds) + Panama Clock + Bankroll Pill + Notifications */}
         <div className="flex items-center gap-3 shrink-0">
+          <div
+            title="Hora oficial de Panamá (America/Panama, UTC-5)"
+            className="hidden md:flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-emerald-950/40 border border-emerald-500/30 text-emerald-300 font-mono text-xs"
+          >
+            <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+            <span className="text-[11px]">🇵🇦 {panamaTime}</span>
+          </div>
+
           <div className="hidden sm:flex items-center gap-2 px-2.5 py-1 rounded-lg bg-slate-900 border border-slate-800 text-xs">
             <DollarSign className="w-3.5 h-3.5 text-emerald-400" />
             <span className="text-slate-400">Bankroll:</span>

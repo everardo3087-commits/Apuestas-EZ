@@ -1,6 +1,7 @@
 import React from 'react';
-import { Search, Filter, Shield, Zap, Calendar, ArrowRight, X } from 'lucide-react';
+import { Search, Filter, Shield, Zap, Calendar, ArrowRight, X, Clock } from 'lucide-react';
 import { Competition, StrategicTier } from '../types/odds';
+import { getPanamaDateString, getPanamaFutureYMD, getPanamaNowInfo } from '../utils/dateUtils';
 
 export type DateFilterMode = 'all' | 'today' | 'next_7_days' | 'custom_range';
 
@@ -34,8 +35,9 @@ export const FilterBar: React.FC<FilterBarProps> = ({
   onBankrollChange,
   matchesCount,
 }) => {
-  const todayStr = new Date().toISOString().split('T')[0];
-  const in7DaysStr = new Date(Date.now() + 7 * 24 * 3600 * 1000).toISOString().split('T')[0];
+  const todayStr = getPanamaDateString();
+  const in7DaysStr = getPanamaFutureYMD(7);
+  const panamaNow = getPanamaNowInfo();
 
   return (
     <div className="bg-slate-900 border border-slate-800 rounded-xl p-4 space-y-4">
@@ -191,11 +193,22 @@ export const FilterBar: React.FC<FilterBarProps> = ({
           )}
         </div>
 
-        {matchesCount !== undefined && (
-          <div className="text-[11px] text-slate-400 font-mono">
-            {matchesCount} partidos coinciden con los filtros
+        {/* Right side: Panama Time Indicator & Matches Count */}
+        <div className="flex flex-wrap items-center gap-2.5">
+          <div
+            title={`Fecha actual en Panamá: ${panamaNow.dateYMD} (${panamaNow.fullString})`}
+            className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-emerald-950/40 border border-emerald-500/30 text-emerald-300 font-mono text-[11px]"
+          >
+            <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+            <span>🇵🇦 Hora Panamá: {panamaNow.time24} (UTC-5)</span>
           </div>
-        )}
+
+          {matchesCount !== undefined && (
+            <div className="text-[11px] text-slate-400 font-mono bg-slate-950 px-2.5 py-1 rounded-lg border border-slate-800">
+              {matchesCount} partidos {filters.dateFilter === 'today' ? 'hoy' : filters.dateFilter === 'next_7_days' ? 'esta semana' : 'encontrados'}
+            </div>
+          )}
+        </div>
       </div>
 
       {/* Row 3: Risk Profile, Small Bankroll Mode & Live Refresh */}

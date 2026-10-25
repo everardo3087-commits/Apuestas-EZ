@@ -6,6 +6,7 @@ import {
   calculateMedian,
   calculateOverround,
 } from './mathEngine';
+import { getPanamaFutureYMD } from './dateUtils';
 
 export const COMPETITIONS: Competition[] = [
   // TOP VALOR
@@ -195,19 +196,21 @@ const RAW_MATCHES_DEF: Array<{
   compSportKey: string;
   home: string;
   away: string;
-  hoursFromNow: number;
+  scheduleDaysAhead: number; // 0 = Hoy en Panamá, 1 = Mañana en Panamá, etc.
+  panamaTimeStr: string;     // Hora fija en Panamá (ej. 13:00, 15:30)
   baseProbs: [number, number, number]; // [H, D, A] sum to ~1.0
   venue: string;
   city: string;
   weather: { condition: string; temperature: number; windSpeedKmH: number; rainProbability: number };
 }> = [
-  // Championship
+  // Championship (Inglaterra)
   {
     id: 'm-efl-1',
     compSportKey: 'soccer_efl_champ',
     home: 'Leeds United',
     away: 'Sunderland',
-    hoursFromNow: 4,
+    scheduleDaysAhead: 0, // HOY en Panamá
+    panamaTimeStr: '11:30',
     baseProbs: [0.54, 0.26, 0.20],
     venue: 'Elland Road',
     city: 'Leeds',
@@ -218,7 +221,8 @@ const RAW_MATCHES_DEF: Array<{
     compSportKey: 'soccer_efl_champ',
     home: 'West Bromwich Albion',
     away: 'Norwich City',
-    hoursFromNow: 8,
+    scheduleDaysAhead: 0, // HOY en Panamá
+    panamaTimeStr: '13:00',
     baseProbs: [0.44, 0.29, 0.27],
     venue: 'The Hawthorns',
     city: 'West Bromwich',
@@ -229,7 +233,8 @@ const RAW_MATCHES_DEF: Array<{
     compSportKey: 'soccer_efl_champ',
     home: 'Middlesbrough',
     away: 'Sheffield United',
-    hoursFromNow: 22,
+    scheduleDaysAhead: 1, // MAÑANA en Panamá
+    panamaTimeStr: '14:30',
     baseProbs: [0.38, 0.28, 0.34],
     venue: 'Riverside Stadium',
     city: 'Middlesbrough',
@@ -242,7 +247,8 @@ const RAW_MATCHES_DEF: Array<{
     compSportKey: 'soccer_spain_segunda_division',
     home: 'Sporting de Gijón',
     away: 'Real Zaragoza',
-    hoursFromNow: 5,
+    scheduleDaysAhead: 0, // HOY en Panamá
+    panamaTimeStr: '14:00',
     baseProbs: [0.47, 0.33, 0.20],
     venue: 'El Molinón',
     city: 'Gijón',
@@ -253,7 +259,8 @@ const RAW_MATCHES_DEF: Array<{
     compSportKey: 'soccer_spain_segunda_division',
     home: 'Racing de Santander',
     away: 'Levante UD',
-    hoursFromNow: 12,
+    scheduleDaysAhead: 0, // HOY en Panamá
+    panamaTimeStr: '15:30',
     baseProbs: [0.40, 0.31, 0.29],
     venue: 'El Sardinero',
     city: 'Santander',
@@ -264,7 +271,8 @@ const RAW_MATCHES_DEF: Array<{
     compSportKey: 'soccer_spain_segunda_division',
     home: 'Burgos CF',
     away: 'SD Eibar',
-    hoursFromNow: 28,
+    scheduleDaysAhead: 1, // MAÑANA en Panamá
+    panamaTimeStr: '16:00',
     baseProbs: [0.35, 0.34, 0.31],
     venue: 'El Plantío',
     city: 'Burgos',
@@ -277,7 +285,8 @@ const RAW_MATCHES_DEF: Array<{
     compSportKey: 'soccer_mexico_ligamx',
     home: 'Club América',
     away: 'Cruz Azul',
-    hoursFromNow: 6,
+    scheduleDaysAhead: 0, // HOY en Panamá
+    panamaTimeStr: '18:00',
     baseProbs: [0.48, 0.27, 0.25],
     venue: 'Estadio Ciudad de los Deportes',
     city: 'Ciudad de México',
@@ -288,7 +297,8 @@ const RAW_MATCHES_DEF: Array<{
     compSportKey: 'soccer_mexico_ligamx',
     home: 'Tigres UANL',
     away: 'CF Monterrey',
-    hoursFromNow: 14,
+    scheduleDaysAhead: 0, // HOY en Panamá
+    panamaTimeStr: '20:30',
     baseProbs: [0.41, 0.30, 0.29],
     venue: 'Estadio Universitario',
     city: 'San Nicolás de los Garza',
@@ -299,7 +309,8 @@ const RAW_MATCHES_DEF: Array<{
     compSportKey: 'soccer_mexico_ligamx',
     home: 'Chivas Guadalajara',
     away: 'Deportivo Toluca',
-    hoursFromNow: 30,
+    scheduleDaysAhead: 2, // En 2 días
+    panamaTimeStr: '19:00',
     baseProbs: [0.39, 0.28, 0.33],
     venue: 'Estadio Akron',
     city: 'Zapopan',
@@ -312,7 +323,8 @@ const RAW_MATCHES_DEF: Array<{
     compSportKey: 'soccer_netherlands_eredivisie',
     home: 'Feyenoord',
     away: 'FC Utrecht',
-    hoursFromNow: 7,
+    scheduleDaysAhead: 0, // HOY en Panamá
+    panamaTimeStr: '12:45',
     baseProbs: [0.63, 0.21, 0.16],
     venue: 'De Kuip',
     city: 'Rotterdam',
@@ -323,7 +335,8 @@ const RAW_MATCHES_DEF: Array<{
     compSportKey: 'soccer_netherlands_eredivisie',
     home: 'AZ Alkmaar',
     away: 'FC Twente',
-    hoursFromNow: 16,
+    scheduleDaysAhead: 2, // En 2 días
+    panamaTimeStr: '14:00',
     baseProbs: [0.45, 0.28, 0.27],
     venue: 'AFAS Stadion',
     city: 'Alkmaar',
@@ -336,7 +349,8 @@ const RAW_MATCHES_DEF: Array<{
     compSportKey: 'soccer_conmebol_copa_libertadores',
     home: 'River Plate',
     away: 'Atlético Mineiro',
-    hoursFromNow: 10,
+    scheduleDaysAhead: 0, // HOY en Panamá
+    panamaTimeStr: '19:30',
     baseProbs: [0.52, 0.28, 0.20],
     venue: 'Estadio Mâs Monumental',
     city: 'Buenos Aires',
@@ -347,7 +361,8 @@ const RAW_MATCHES_DEF: Array<{
     compSportKey: 'soccer_conmebol_copa_libertadores',
     home: 'Palmeiras',
     away: 'Botafogo',
-    hoursFromNow: 32,
+    scheduleDaysAhead: 1, // MAÑANA en Panamá
+    panamaTimeStr: '19:30',
     baseProbs: [0.46, 0.29, 0.25],
     venue: 'Allianz Parque',
     city: 'São Paulo',
@@ -360,22 +375,12 @@ const RAW_MATCHES_DEF: Array<{
     compSportKey: 'soccer_brazil_campeonato',
     home: 'Flamengo',
     away: 'Internacional',
-    hoursFromNow: 11,
+    scheduleDaysAhead: 0, // HOY en Panamá
+    panamaTimeStr: '21:00',
     baseProbs: [0.55, 0.25, 0.20],
     venue: 'Maracanã',
     city: 'Río de Janeiro',
     weather: { condition: 'Despejado cálido', temperature: 28, windSpeedKmH: 12, rainProbability: 10 },
-  },
-  {
-    id: 'm-bra-2',
-    compSportKey: 'soccer_brazil_campeonato',
-    home: 'São Paulo FC',
-    away: 'Athletico Paranaense',
-    hoursFromNow: 25,
-    baseProbs: [0.49, 0.28, 0.23],
-    venue: 'MorumBIS',
-    city: 'São Paulo',
-    weather: { condition: 'Nubosidad variable', temperature: 22, windSpeedKmH: 11, rainProbability: 30 },
   },
 
   // MLS
@@ -384,31 +389,22 @@ const RAW_MATCHES_DEF: Array<{
     compSportKey: 'soccer_usa_mls',
     home: 'Inter Miami CF',
     away: 'Columbus Crew',
-    hoursFromNow: 9,
+    scheduleDaysAhead: 0, // HOY en Panamá
+    panamaTimeStr: '17:30',
     baseProbs: [0.51, 0.24, 0.25],
     venue: 'Chase Stadium',
     city: 'Fort Lauderdale',
     weather: { condition: 'Cálido tropical', temperature: 29, windSpeedKmH: 16, rainProbability: 20 },
   },
-  {
-    id: 'm-mls-2',
-    compSportKey: 'soccer_usa_mls',
-    home: 'LAFC',
-    away: 'Seattle Sounders',
-    hoursFromNow: 36,
-    baseProbs: [0.48, 0.27, 0.25],
-    venue: 'BMO Stadium',
-    city: 'Los Ángeles',
-    weather: { condition: 'Despejado', temperature: 21, windSpeedKmH: 8, rainProbability: 0 },
-  },
 
-  // UEFA Champions League (Bajo valor para contrastar)
+  // UEFA Champions League
   {
     id: 'm-ucl-1',
     compSportKey: 'soccer_uefa_champs_league',
     home: 'Real Madrid',
     away: 'Borussia Dortmund',
-    hoursFromNow: 18,
+    scheduleDaysAhead: 1, // MAÑANA en Panamá
+    panamaTimeStr: '15:00',
     baseProbs: [0.62, 0.21, 0.17],
     venue: 'Santiago Bernabéu',
     city: 'Madrid',
@@ -424,7 +420,11 @@ export function generateInitialMatches(): MatchEvent[] {
 
   return RAW_MATCHES_DEF.map((def, matchIdx) => {
     const comp = COMPETITIONS.find((c) => c.sportKey === def.compSportKey) || COMPETITIONS[0];
-    const commence = new Date(now.getTime() + def.hoursFromNow * 3600 * 1000);
+    
+    // Construct exact ISO timestamp locked to Panama Time (UTC-5)
+    const targetYMD = getPanamaFutureYMD(def.scheduleDaysAhead);
+    const commenceIso = `${targetYMD}T${def.panamaTimeStr}:00-05:00`;
+    const commence = new Date(commenceIso);
 
     const quotesHome: Quote[] = [];
     const quotesDraw: Quote[] = [];

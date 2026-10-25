@@ -1,6 +1,7 @@
 import React from 'react';
 import { SteamMove } from '../types/odds';
 import { TrendingDown, ArrowDownRight, Activity, AlertTriangle, Clock } from 'lucide-react';
+import { getPanamaTimeString } from '../utils/dateUtils';
 
 interface SteamMovesViewProps {
   steamMoves: SteamMove[];
@@ -45,11 +46,7 @@ export const SteamMovesView: React.FC<SteamMovesViewProps> = ({ steamMoves, onSe
 
           <div className="divide-y divide-slate-800/80">
             {steamMoves.map((move) => {
-              const time = new Date(move.timestamp).toLocaleTimeString('es-ES', {
-                hour: '2-digit',
-                minute: '2-digit',
-                second: '2-digit',
-              });
+              const time = `${getPanamaTimeString(move.timestamp)} (Panamá)`;
 
               return (
                 <div

@@ -6,6 +6,7 @@ import dotenv from 'dotenv';
 import { GoogleGenAI, Type } from '@google/genai';
 import { generateInitialMatches, applyLiveTick, COMPETITIONS } from './src/utils/mockOddsGenerator';
 import { MatchEvent, SteamMove, PersonalBet } from './src/types/odds';
+import { getPanamaDateString } from './src/utils/dateUtils';
 
 dotenv.config();
 
@@ -220,10 +221,10 @@ app.get('/api/football/enrich', async (req: Request, res: Response) => {
   res.json(enrichmentResult);
 });
 
-// API-Football: Fetch Live Fixtures from API-Sports by Date
+// API-Football: Fetch Live Fixtures from API-Sports by Date (Timezone: America/Panama)
 app.get('/api/football/fixtures-today', async (_req: Request, res: Response) => {
-  const today = new Date().toISOString().split('T')[0];
-  const cacheKey = `fixtures-date-${today}`;
+  const today = getPanamaDateString(new Date());
+  const cacheKey = `fixtures-date-${today}-panama`;
   const cached = footballCache.get(cacheKey);
 
   if (cached && Date.now() - cached.timestamp < FOOTBALL_CACHE_TTL) {
@@ -231,7 +232,7 @@ app.get('/api/football/fixtures-today', async (_req: Request, res: Response) => 
   }
 
   try {
-    const response = await fetch(`${FOOTBALL_API_BASE}/fixtures?date=${today}`, {
+    const response = await fetch(`${FOOTBALL_API_BASE}/fixtures?date=${today}&timezone=America/Panama`, {
       headers: {
         'x-apisports-key': API_FOOTBALL_KEY,
       },
